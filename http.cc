@@ -139,6 +139,7 @@ HTTPParser::parse_header_line()
         }
     }
     // fix host terminator to make getaddrinfo happy
+    assert(host.end() < found_line.end());
     host_terminator = *host.end();
     *const_cast<char*>(host.end()) = 0;
     host_cstr = host.begin();

@@ -19,7 +19,8 @@
 #include "http.h"
 #include "util.h"
 
-class OnEventLoop
+class OnEventLoop :
+    public virtual non_copyable
 {
 protected:
     bool read_expected = true;
@@ -150,50 +151,51 @@ public:
         start_conn_watcher(events);
     }
 
-    OnEventLoop(const OnEventLoop&) = delete;
     virtual ~OnEventLoop()
     {
         terminate();
-        debug("ConnectionCtx destroying");
+        debug("OnEventLoop destroying");
     }
 };
 
-class ProxyBackend : public OnEventLoop
+
+class ProxyFrontend;
+
+class ProxyBackend :
+    public OnEventLoop,
+    public virtual non_copyable // because of references
 {
     friend class ProxyFrontend;
 protected:
     static const size_t buf_size = 4096;
+    char input_buf[buf_size];
     char output_buf[buf_size];
+    buffer::string received;
     buffer::string output_data;
+    ProxyFrontend &frontend;
 
 public:
-    ProxyBackend(struct ev_loop *event_loop_) :
-        OnEventLoop(event_loop_)
-    {
-        int sock_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-        if (sock_fd < 0) {
-            throw Errno("socket");;
-        }
-
-        conn_watcher.fd = sock_fd;
-    }
+    ProxyBackend(ProxyFrontend& frontend_, struct ev_loop* event_loop_);
 
     bool connect(const char* output_end, const char* host, uint32_t port);
 
-    void read_callback() override
-    {}
+    void read_callback() override;
 
     void write_callback() override;
 };
 
+
 class ProxyFrontend :
     public OnEventLoop,
     public OnPool<ProxyFrontend>,
-    public non_copyable // because of references in HTTPParser
+    public virtual non_copyable // because of references in HTTPParser
 {
+    friend class ProxyBackend;
+protected:
     static const size_t buf_size = 4096;
     char input_buf[buf_size];
     buffer::string received;
+    buffer::string output_data;
     ProxyBackend backend;
     HTTPParser parser;
     ssize_t sent_size = 0;
@@ -202,9 +204,9 @@ public:
     ProxyFrontend(struct ev_loop* event_loop_, int conn_fd);
 
     void read_callback() override;
-    void write_callback() override
-    {}
+    void write_callback() override;
 };
+
 
 class BackendOnPool :
     public ProxyBackend,

@@ -87,6 +87,11 @@ public:
     void operator delete (void * addr)
     {
     }
+
+    void release()
+    {
+        delete dynamic_cast<Object *>(this);
+    }
 };
 
 #endif // __cd_pool_h

@@ -7,7 +7,7 @@ INIT_POOL(BackendOnPool);
 ProxyFrontend::ProxyFrontend(struct ev_loop* event_loop_, int conn_fd):
     OnEventLoop(event_loop_, conn_fd),
     received(input_buf, buffer::string::size_type(0)),
-    backend(event_loop_),
+    backend(*this, event_loop_),
     parser(received, { backend.output_buf, backend.buf_size })
 {
 }
@@ -26,22 +26,29 @@ Data is transferred uncopied. Both buffers should be united for data copy.
 void ProxyFrontend::read_callback()
 {
     size_t free_size = buf_size - received.size();
-    size_t recv_size = recv(conn_watcher.fd, const_cast<char*>(received.end()), buf_size - received.size(), 0);
+    if (free_size == 0) {
+        error("Not enough buffer!");
+        release();
+        return;
+    }
+    size_t recv_size = recv(conn_watcher.fd, const_cast<char*>(received.end()), free_size, 0);
     if (recv_size == 0) {
         debug("peer shutdown");
-        delete this;
+        release();
         return;
     }
     if (recv_size == -1) {
         switch (errno) {
         case ENOTCONN:
             debug("peer reset");
-            delete this;
+            release();
             return;
-        case EAGAIN:
+        case EWOULDBLOCK:
             return;
         default:
-            throw Errno("recv");
+            error("recv: ", strerror(errno));
+            release();
+            return;
         }
     }
     HTTPParser::Status s = parser({ received.end(), recv_size });
@@ -53,21 +60,24 @@ void ProxyFrontend::read_callback()
     case HTTPParser::PROCEED: // reached request end
         if (parser.host.empty()) {
             debug("No Host header in request!");
-            delete this;
+            release();
             return;
         }
         debug("Got request ", parser.request_uri);
         stop_events(EV_READ);
 
+        output_data = backend.received;
         if (backend.connect(parser.output_end(), parser.host_cstr, parser.port)) {
             debug("Backend connection failed!");
-            delete this;
+            release();
             return;
         }
+
+        start_events(EV_WRITE);
         return;
     case HTTPParser::TERMINATE:
         error("Parsing HTTP request failed!");
-        delete this;
+        release();
         return;
     default:
         break;
@@ -76,9 +86,57 @@ void ProxyFrontend::read_callback()
     if (received.size() >= buf_size) {
         // TODO: mmap-based ring buffer (see https://github.com/willemt/cbuffer)
         error("Not enough buffer!");
-        delete this;
+        release();
         return;
     }
+}
+
+// TODO: code is mostly duplicated!
+void ProxyFrontend::write_callback()
+{
+    // do we need getsockopt(conn_watcher.fd, SOL_SOCKET, SO_ERROR, ...) ?
+    if (output_data.empty()) {
+        debug("Warning: spurious write!");
+        return;
+    }
+    ssize_t sent_size = send(conn_watcher.fd, output_data.data(), output_data.size(), MSG_NOSIGNAL);
+    if (sent_size < 0) {
+        switch (errno) {
+        case ECONNRESET:
+        case ENOTCONN:
+            debug("peer reset");
+            release();
+            return;
+        case EWOULDBLOCK:
+            return;
+        default:
+            error("send: ", strerror(errno));
+            release();
+            return;
+        }
+    }
+
+    if (sent_size == 0)
+        return; // unexpected
+
+    output_data.shrink_front(sent_size);
+    if (output_data.empty()) {
+        stop_events(EV_WRITE);
+    }
+}
+
+
+ProxyBackend::ProxyBackend(ProxyFrontend& frontend_, struct ev_loop* event_loop_):
+    OnEventLoop(event_loop_),
+    received(input_buf, buffer::string::size_type(0)),
+    frontend(frontend_)
+{
+    int sock_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (sock_fd < 0) {
+        throw Errno("socket");;
+    }
+
+    conn_watcher.fd = sock_fd;
 }
 
 bool ProxyBackend::connect(const char* output_end, const char* host, uint32_t port)
@@ -116,5 +174,75 @@ bool ProxyBackend::connect(const char* output_end, const char* host, uint32_t po
 void ProxyBackend::write_callback()
 {
     // do we need getsockopt(conn_watcher.fd, SOL_SOCKET, SO_ERROR, ...) ?
+    if (output_data.empty()) {
+        debug("Warning: spurious write!");
+        return;
+    }
+    ssize_t sent_size = send(conn_watcher.fd, output_data.data(), output_data.size(), MSG_NOSIGNAL);
+    if (sent_size < 0) {
+        switch (errno) {
+        case ECONNRESET:
+        case ENOTCONN:
+            debug("peer reset");
+            frontend.release();
+            return;
+        case EWOULDBLOCK:
+            return;
+        default:
+            error("send: ", strerror(errno));
+            frontend.release();
+            return;
+        }
+    }
 
+    if (sent_size == 0)
+        return; // unexpected
+
+    output_data.shrink_front(sent_size);
+    if (output_data.empty()) {
+        stop_events(EV_WRITE);
+        start_events(EV_READ);
+    }
+}
+
+void ProxyBackend::read_callback()
+{
+    assert(frontend.output_data.begin() != nullptr);
+    bool start_frontend_write = false;
+    if (frontend.output_data.empty()) {
+        received.assign(input_buf, buffer::string::size_type(0));
+        start_frontend_write = true;
+    }
+    size_t free_size = buf_size - received.size();
+    if (free_size == 0) {
+        debug("Input buffer is full!");
+        return;
+    }
+    size_t recv_size = recv(conn_watcher.fd, const_cast<char*>(received.end()), free_size, 0);
+    if (recv_size == 0) {
+        debug("peer shutdown");
+        frontend.release();
+        return;
+    }
+    if (recv_size == -1) {
+        switch (errno) {
+        case ENOTCONN:
+            debug("peer reset");
+            frontend.release();
+            return;
+        case EWOULDBLOCK:
+            return;
+        default:
+            error("recv: ", strerror(errno));
+            frontend.release();
+            return;
+        }
+    }
+
+    received.grow(recv_size);
+    assert(received.size() <= buf_size);
+    frontend.output_data.grow(recv_size);
+    if (start_frontend_write) {
+        frontend.start_events(EV_WRITE);
+    }
 }
