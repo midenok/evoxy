@@ -9,12 +9,6 @@ const std::string LWSP("\t \r\n");
 const std::string HOST("host");
 const std::string UA("user-agent");
 
-HTTPParser::HTTPParser(buffer::string &full_buf_):
-    parse_line{&HTTPParser::parse_request_line},
-    full_buf{full_buf_}
-{
-}
-
 bool HTTPParser::next_line()
 {
     // scan_buf may be empty (see last comment in this loop)
@@ -44,7 +38,7 @@ bool HTTPParser::next_line()
                 continue;
             }
         }
-        found_line.assign(found_line.empty() ? full_buf.begin() : found_line.end(), &scan_buf[crlf_end]);
+        found_line.assign(found_line.empty() ? input_buf.begin() : found_line.end(), &scan_buf[crlf_end]);
         // Can make scan_buf empty when request line ends exactly on chunk boundary:
         scan_buf.assign(&scan_buf[crlf_end], scan_buf.end());
         return true;
@@ -84,25 +78,41 @@ HTTPParser::parse_request_line()
 
     http_version.assign(&found_line[sp2], found_line.end() - CRLF.size());
     parse_line = &HTTPParser::parse_header_line;
+
+    if (found_line.size() > output_buf.size()) {
+        error("Not enough space in output buffer!");
+        return TERMINATE;
+    }
+
+    found_line.copy(output_buf);
+    output_buf.shrink_front(found_line.size());
     return CONTINUE;
 }
 
 HTTPParser::Status
 HTTPParser::parse_header_line()
 {
+    if (found_line.size() > output_buf.size()) {
+        error("Not enough space in output buffer!");
+        return TERMINATE;
+    }
+
     if (found_line.size() == CRLF.size()) {
         // found CRLFCRLF sequence
+        found_line.copy(output_buf);
+        output_buf.shrink_front(found_line.size());
         return PROCEED;
     }
-    if (WSP.find(found_line[0]) != std::string::npos) {
-        // line begins with WSP, we just skip multi-line header values
-        return CONTINUE;
-    }
+
     size_t cl = found_line.find(':');
     if (cl == buffer::string::npos) {
         debug("Wrong header line: no colon char!");
         return TERMINATE;
     }
+
+    found_line.copy(output_buf);
+    output_buf.shrink_front(found_line.size());
+
     buffer::istring name(found_line.begin(), cl);
 
     if (name != HOST) {
@@ -119,7 +129,19 @@ HTTPParser::parse_header_line()
         debug("Wrong header line: no value (2)!");
         return TERMINATE;
     }
-    host_header.assign(&found_line[val], found_line.end() - CRLF.size());
+    host.assign(&found_line[val], found_line.end() - CRLF.size());
+    cl = host.find(':');
+    if (cl != buffer::string::npos) {
+        host.assign(host.begin(), &host[cl]);
+        if (++cl < host.size()) {
+            buffer::string port_(&host[cl], host.end());
+            port = buffer::stoi(port_);
+        }
+    }
+    // fix host terminator to make getaddrinfo happy
+    host_terminator = *host.end();
+    *const_cast<char*>(host.end()) = 0;
+    host_cstr = host.begin();
     return CONTINUE;
 }
 
@@ -130,14 +152,14 @@ HTTPParser::Status HTTPParser::operator()(buffer::string recv_buf)
     if (!scan_buf_store.empty()) {
         scan_buf.assign(scan_buf_store.begin(), recv_buf.end());
         scan_buf_store.clear();
-    } else if (recv_buf.begin() > &full_buf[CRLF.size() - 1]) {
+    } else if (recv_buf.begin() > &input_buf[CRLF.size() - 1]) {
         // Position scan_buf to (recv_buf - CRLF.size() + 1):
         // full_buf already contains more than (CRLF.size() - 1) bytes,
         // we shift back recv_buf by this value. This is done for case
         // when beginning of recv_buf contains tail of CRLF (CRLF was split by 2 chunks).
         scan_buf.assign(&recv_buf[1 - CRLF.size()], recv_buf.end());
     } else {
-        scan_buf.assign(full_buf.begin(), recv_buf.end());
+        scan_buf.assign(input_buf.begin(), recv_buf.end());
     }
 
     if (scan_buf.size() < CRLF.size())

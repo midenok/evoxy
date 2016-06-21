@@ -1,205 +1,18 @@
 #include <iostream>
-#include <algorithm>
 #include <cstdio>
-#include <cstring>
-#include <unistd.h>
 #include "udtproxy.h"
 
-#include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <ev.h>
 
 #include "threads.h"
 #include "pool.h"
-#include "http.h"
 #include "util.h"
+#include "connection.h"
 
 ThreadPool thread_pool;
 
-class ConnectionCtx : public OnPool<ConnectionCtx>
-{
-    static const size_t buf_size = 4096;
-    struct ev_loop *event_loop;
-    ev_io conn_watcher;
-    ev_async async_watcher;
-    char full_buf[buf_size + 1];
-    buffer::string received;
-    HTTPParser parser;
-    bool read_expected = true;
-    ssize_t sent_size = 0;
-    bool async_task = false;
-
-    /*
-        1. load whole HTTP head into static buffer;
-        2. while loading parse it into entities (method, URI, headers);
-        3. when head parsing is finished (got CRLFCRLF sequence), check Host header
-    */
-
-    void read_conn()
-    {
-        size_t free_size = buf_size - received.size();
-        size_t recv_size = recv(conn_watcher.fd, const_cast<char*>(received.end()), buf_size - received.size(), 0);
-        if (recv_size == 0) {
-            debug ("peer shutdown");
-            delete this;
-            return;
-        }
-        if (recv_size == -1) {
-            switch (errno) {
-                case ENOTCONN:
-                    debug ("peer reset");
-                    delete this;
-                    return;
-                case EAGAIN:
-                    return;
-                default:
-                    throw Errno("recv");
-            }
-        }
-        HTTPParser::Status s = parser({ received.end(), recv_size });
-
-        received.grow(recv_size);
-        assert (received.size() <= buf_size);
-
-        switch(s) {
-            case HTTPParser::TERMINATE:
-                delete this;
-                return;
-            case HTTPParser::PROCEED: // reached request end
-                // debug("got request service ", parser.service);
-                read_expected = false;
-
-                /* For fast request we do processing inside accept thread.
-                    In this example there is no processing at all, we just activate
-                    response sending. */
-                ev_io_stop(event_loop, &conn_watcher);
-                conn_watcher.events = EV_READ | EV_WRITE;
-                ev_io_start(event_loop, &conn_watcher);
-
-                return;
-            default:
-                break;
-        }
-
-        if (received.size() >= buf_size) {
-            // TODO: mmap-based ring buffer (see https://github.com/willemt/cbuffer)
-            error("Not enough buffer!");
-            delete this;
-            return;
-        }
-    }
-
-    void terminate()
-    {
-        if (conn_watcher.fd) {
-            debug("terminating connection");
-            ev_io_stop(event_loop, &conn_watcher);
-            close(conn_watcher.fd);
-            conn_watcher.fd = 0;
-        }
-    }
-
-    void read_unexpected()
-    {
-        char buf[1];
-        size_t recv_size = recv(conn_watcher.fd, buf, 1, 0);
-        if (recv_size == -1) {
-            switch (errno) {
-                case ENOTCONN:
-                    debug ("peer reset");
-                    if (async_task)
-                        terminate();
-                    else
-                        delete this;
-                    return;
-                case EAGAIN:
-                    return;
-                default:
-                    throw Errno("recv");
-            }
-        }
-        if (recv_size == 0)
-            debug("peer shutdown");
-        else
-            debug("unexpected read!");
-        if (async_task)
-            terminate();
-        else
-            delete this;
-        return;
-    }
-
-    void write_conn()
-    {
-#if 0
-        ssize_t send_sz = send(conn_watcher.fd, RESPONSE.data() + sent_size, RESPONSE.size() - sent_size, 0);
-        sent_size += send_sz;
-        if (sent_size == RESPONSE.size()) {
-            debug("sent reply");
-            delete this;
-            return;
-        }
-#endif
-    }
-
-    static void
-    conn_callback (EV_P_ ev_io *w, int revents)
-    {
-        ConnectionCtx *self = (ConnectionCtx *)w->data;
-        if (revents & EV_READ) {
-            if (self->read_expected) {
-                self->read_conn();
-            } else {
-                self->read_unexpected();
-            }
-        }
-        if (revents & EV_WRITE)
-            self->write_conn();
-    }
-
-    static void
-    async_callback (EV_P_ ev_async *w, int revents)
-    {
-        ConnectionCtx *self = (ConnectionCtx *)w->data;
-        self->async_task = false;
-        ev_async_stop(self->event_loop, &self->async_watcher);
-        if (self->conn_watcher.fd == 0) {
-            delete self;
-            return;
-        }
-        ev_io_stop(self->event_loop, &self->conn_watcher);
-        self->conn_watcher.events = EV_READ | EV_WRITE;
-        ev_io_start(self->event_loop, &self->conn_watcher);
-    }
-
-public:
-    ConnectionCtx(struct ev_loop *event_loop_, int conn_fd) :
-        received(full_buf, buffer::string::size_type(0)),
-        event_loop{event_loop_},
-        parser(received)
-    {
-        debug("ConnectionCtx created");
-        if (fcntl(conn_fd, F_SETFL, fcntl(conn_fd, F_GETFL, 0) | O_NONBLOCK) == -1) {
-            throw Errno("fcntl");
-        }
-        ev_io_init (&conn_watcher, conn_callback, conn_fd, EV_READ);
-        ev_async_init (&async_watcher, async_callback);
-        conn_watcher.data = this;
-        async_watcher.data = this;
-        ev_io_start(event_loop, &conn_watcher);
-    }
-    ConnectionCtx(const ConnectionCtx&) = delete;
-    ~ConnectionCtx()
-    {
-        terminate();
-        debug("ConnectionCtx destroying");
-    }
-};
-
-INIT_POOL(ConnectionCtx);
 
 using std::unique_ptr;
 
@@ -220,7 +33,8 @@ class AcceptTask : public Task
     // libev entities
     struct ev_loop *event_loop;
     ev_io accept_watcher;
-    unique_ptr<Pool<ConnectionCtx> > pool;
+    typedef Pool<ProxyFrontend> ConnectionPool;
+    std::unique_ptr<ConnectionPool> pool;
 
     void
     accept_conn()
@@ -238,7 +52,7 @@ class AcceptTask : public Task
             return;
         }
         debug("got connection!");
-        new (*pool) ConnectionCtx(event_loop, conn_fd);
+        new (*pool) ProxyFrontend(event_loop, conn_fd);
     }
 
     static void
@@ -254,13 +68,13 @@ public:
         decltype(pool)::element_type::memsize(capacity);
     }
 
-    AcceptTask(size_t conn_capacity) :
-        pool(new Pool<ConnectionCtx>(conn_capacity))
+    AcceptTask(size_t conn_capacity) : 
+        pool(new ConnectionPool(conn_capacity))
     {
         debug("AcceptTask created");
         // listen socket setup
         listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (listen_fd == -1) {
+        if (listen_fd < 0) {
             throw Errno("socket");;
         }
         int sock_opt = 1;

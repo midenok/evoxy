@@ -3,6 +3,7 @@
 
 #include <ostream>
 #include <iterator>
+#include <locale>
 
 namespace buffer
 {
@@ -362,8 +363,15 @@ public:
      * @return the number of characters actually copied.
      */
     size_type
-    copy(noconst_value_type* ptr, size_type count, size_type pos = 0) const
+    copy(noconst_value_type* ptr, size_type count = npos, size_type pos = 0) const
     throw ();
+
+    size_type
+    copy(basic_string& dst, size_type count = npos, size_type pos = 0) const
+        throw()
+    {
+        return copy(const_cast<noconst_value_type*>(dst.begin()), count, pos);
+    }
 
     // Finders
     /**
@@ -636,9 +644,26 @@ public:
     }
 
     void
+    grow_front(size_type count)
+    throw ()
+    {
+        begin_ -= count;
+        length_ += count;
+    }
+
+    void
     shrink(size_type count)
     throw ()
     {
+        // count = std::min(count, length_);
+        length_ -= count;
+    }
+
+    void
+    shrink_front(size_type count)
+    {
+        // count = std::min(count, length_);
+        begin_ += count;
         length_ -= count;
     }
 
@@ -2124,6 +2149,19 @@ throw ()
 {
     return find_last_not_of(
         basic_string<CharT, Traits>(ptr, count), pos);
+}
+
+inline int stoi(const string& str, size_t *idx = 0)
+{	// convert string to int
+    int x = 0;
+    size_t n = 0;
+    while (&str[n] != str.end() && isdigit(str[n])) {
+        x = x * 10 + (str[n] - '0');
+        n++;
+    }
+    if (idx)
+        *idx = n;
+    return x;
 }
 }
 

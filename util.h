@@ -62,4 +62,14 @@ if (ENABLED_OPT(VERBOSE)) \
 #define cerror(...)  debug_message(std::cerr, '#', __FILE__, __LINE__, '#', __VA_ARGS__)
 #endif // NDEBUG
 
+class non_copyable
+{
+protected:
+    non_copyable() = default;
+    ~non_copyable() = default;
+
+    non_copyable(non_copyable const &) = delete;
+    void operator=(non_copyable const &x) = delete;
+};
+
 #endif //__cd_util_h
