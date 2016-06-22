@@ -167,6 +167,7 @@ class ProxyBackend :
 {
     friend class ProxyFrontend;
 protected:
+    // TODO: test with buf_size = 1, 2, 3, etc.
     static const size_t buf_size = 4096;
     char input_buf[buf_size];
     char output_buf[buf_size];

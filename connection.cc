@@ -73,7 +73,6 @@ void ProxyFrontend::read_callback()
             return;
         }
 
-        start_events(EV_WRITE);
         return;
     case HTTPParser::TERMINATE:
         error("Parsing HTTP request failed!");
@@ -95,10 +94,12 @@ void ProxyFrontend::read_callback()
 void ProxyFrontend::write_callback()
 {
     // do we need getsockopt(conn_watcher.fd, SOL_SOCKET, SO_ERROR, ...) ?
+#ifndef NDEBUG
     if (output_data.empty()) {
         debug("Warning: spurious write!");
         return;
     }
+#endif
     ssize_t sent_size = send(conn_watcher.fd, output_data.data(), output_data.size(), MSG_NOSIGNAL);
     if (sent_size < 0) {
         switch (errno) {
@@ -174,10 +175,12 @@ bool ProxyBackend::connect(const char* output_end, const char* host, uint32_t po
 void ProxyBackend::write_callback()
 {
     // do we need getsockopt(conn_watcher.fd, SOL_SOCKET, SO_ERROR, ...) ?
+#ifndef NDEBUG
     if (output_data.empty()) {
         debug("Warning: spurious write!");
         return;
     }
+#endif
     ssize_t sent_size = send(conn_watcher.fd, output_data.data(), output_data.size(), MSG_NOSIGNAL);
     if (sent_size < 0) {
         switch (errno) {
@@ -221,14 +224,16 @@ void ProxyBackend::read_callback()
     size_t recv_size = recv(conn_watcher.fd, const_cast<char*>(received.end()), free_size, 0);
     if (recv_size == 0) {
         debug("peer shutdown");
-        frontend.release();
+        stop_events(EV_READ);
+        // FIXME: indicate connection status
         return;
     }
     if (recv_size == -1) {
         switch (errno) {
         case ENOTCONN:
             debug("peer reset");
-            frontend.release();
+            stop_events(EV_READ);
+            // FIXME: indicate connection status
             return;
         case EWOULDBLOCK:
             return;
