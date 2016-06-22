@@ -2,6 +2,7 @@
 #include <cassert>
 #include "http.h"
 #include "util.h"
+#include "connection.h"
 
 const std::string CRLF("\r\n");
 const std::string WSP("\t ");
@@ -10,6 +11,25 @@ const std::string HOST("host");
 const std::string CONTENT_LENGTH("content-length");
 const std::string TRANSFER_ENCODING("transfer-encoding");
 const std::string CHUNKED("chunked");
+
+HTTPParser::HTTPParser(buffer::string &input_buf_, IOBuffer &output_buf_) :
+    parse_line { &HTTPParser::parse_request_line },
+    input_buf { input_buf_ },
+    output_buf { output_buf_ }
+{}
+
+bool HTTPParser::copy_found_line()
+{
+    if (found_line.size() > output_buf.free_size()) {
+        error("Not enough space in output buffer!");
+        return true;
+    }
+
+    output_buf.grow(found_line.size());
+    found_line.copy(output_buf);
+    output_buf.shrink_front(found_line.size());
+    return false;
+}
 
 bool HTTPParser::next_line()
 {
@@ -81,13 +101,9 @@ HTTPParser::parse_request_line()
     http_version.assign(&found_line[sp2], found_line.end() - CRLF.size());
     parse_line = &HTTPParser::parse_header_line;
 
-    if (found_line.size() > output_buf.size()) {
-        error("Not enough space in output buffer!");
+    if (copy_found_line())
         return TERMINATE;
-    }
 
-    found_line.copy(output_buf);
-    output_buf.shrink_front(found_line.size());
     return CONTINUE;
 }
 
@@ -113,16 +129,12 @@ HTTPParser::get_header_value(STRING& value, size_t& cl)
 HTTPParser::Status
 HTTPParser::parse_header_line()
 {
-    if (found_line.size() > output_buf.size()) {
-        error("Not enough space in output buffer!");
-        return TERMINATE;
-    }
-
     if (found_line.size() == CRLF.size()) {
         // found CRLFCRLF sequence
-        found_line.copy(output_buf);
-        output_buf.shrink_front(found_line.size());
-        return PROCEED;
+        if (copy_found_line())
+            return TERMINATE;
+        output_buf.assign(output_buf.buffer_begin(), output_buf.end());
+        return HEAD_FINISHED;
     }
 
     size_t cl = found_line.find(':');
@@ -131,8 +143,9 @@ HTTPParser::parse_header_line()
         return TERMINATE;
     }
 
-    found_line.copy(output_buf);
-    output_buf.shrink_front(found_line.size());
+    // TODO: modify headers in output
+    if (copy_found_line())
+        return TERMINATE;
 
     // TODO: optimization: eliminate uppercasing of static strings
     buffer::istring name(found_line.begin(), cl);
@@ -166,28 +179,28 @@ HTTPParser::parse_header_line()
             return TERMINATE;
 
         if (transfer_encoding == CHUNKED) {
-            chunked_body = true;
+            chunked = true;
         }
     }
 
     return CONTINUE;
 }
 
-HTTPParser::Status HTTPParser::operator()(buffer::string recv_buf)
+HTTPParser::Status HTTPParser::operator()(buffer::string &recv_chunk)
 {
-    assert(!recv_buf.empty());
+    assert(!recv_chunk.empty());
     
     if (!scan_buf_store.empty()) {
-        scan_buf.assign(scan_buf_store.begin(), recv_buf.end());
+        scan_buf.assign(scan_buf_store.begin(), recv_chunk.end());
         scan_buf_store.clear();
-    } else if (recv_buf.begin() > &input_buf[CRLF.size() - 1]) {
+    } else if (recv_chunk.begin() > &input_buf[CRLF.size() - 1]) {
         // Position scan_buf to (recv_buf - CRLF.size() + 1):
         // full_buf already contains more than (CRLF.size() - 1) bytes,
         // we shift back recv_buf by this value. This is done for case
         // when beginning of recv_buf contains tail of CRLF (CRLF was split by 2 chunks).
-        scan_buf.assign(&recv_buf[1 - CRLF.size()], recv_buf.end());
+        scan_buf.assign(&recv_chunk[1 - CRLF.size()], recv_chunk.end());
     } else {
-        scan_buf.assign(input_buf.begin(), recv_buf.end());
+        scan_buf.assign(input_buf.begin(), recv_chunk.end());
     }
 
     if (scan_buf.size() < CRLF.size())

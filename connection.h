@@ -126,6 +126,19 @@ protected:
         }
     }
 
+    void start_only_events(int events)
+    {
+        if (conn_watcher.events)
+            ev_io_stop(event_loop, &conn_watcher);
+        conn_watcher.events = events;
+        ev_io_start(event_loop, &conn_watcher);
+    }
+
+    void stop_all_events()
+    {
+        ev_io_stop(event_loop, &conn_watcher);
+        conn_watcher.events = 0;
+    }
 public:
     OnEventLoop(struct ev_loop *event_loop_) :
         event_loop { event_loop_ }
@@ -160,6 +173,102 @@ public:
 };
 
 
+class IOBuffer : public buffer::string
+{
+    buffer::string buffer;
+
+public:
+    enum Status
+    {
+        OK,
+        BUFFER_FULL,
+        SHUTDOWN,
+        WOULDBLOCK,
+        OTHER_ERROR
+    };
+
+    IOBuffer(buffer::string buffer_) :
+        buffer::string(buffer_.begin(), size_type(0)),
+        buffer { buffer_ }
+    {}
+
+    void reset()
+    {
+        assign(buffer.begin(), size_type(0));
+    }
+
+    void clear()
+    {
+        reset();
+    }
+
+    size_type free_size()
+    {
+        return buffer.end() - end();
+    }
+
+    buffer::string::pointer buffer_begin()
+    {
+        return buffer.begin();
+    }
+
+    Status recv(int fd, buffer::string &recv_chunk)
+    {
+        size_type free_size = IOBuffer::free_size();
+        if (free_size == 0) {
+            debug("buffer full");
+            return BUFFER_FULL;
+        }
+        ssize_t recv_size = ::recv(fd, const_cast<char*>(end()), free_size, 0);
+        if (recv_size == 0) {
+            debug("peer shutdown");
+            return SHUTDOWN;
+        }
+        if (recv_size < 0) {
+            switch (errno) {
+            case EWOULDBLOCK:
+                return WOULDBLOCK;
+            case ECONNRESET:
+            case ENOTCONN:
+                debug("peer reset");
+                return OTHER_ERROR;
+            default:
+                error("recv: ", strerror(errno));
+                return OTHER_ERROR;
+            }
+        }
+        recv_chunk.assign(end(), recv_size);
+        grow(recv_size);
+        assert(end() <= buffer.end());
+        return OK;
+    }
+
+    Status send(int fd)
+    {
+        ssize_t sent_size = ::send(fd, data(), size(), MSG_NOSIGNAL);
+        if (sent_size < 0) {
+            switch (errno) {
+            case EWOULDBLOCK:
+                return WOULDBLOCK;
+            case ECONNRESET:
+            case ENOTCONN:
+                debug("peer reset");
+                return OTHER_ERROR;
+            default:
+                error("send: ", strerror(errno));
+                return OTHER_ERROR;
+            }
+        }
+
+        if (sent_size == 0)
+            return WOULDBLOCK; // unexpected
+
+        shrink_front(sent_size);
+        return OK;
+    }
+};
+
+
 class ProxyFrontend;
 
 class ProxyBackend :
@@ -171,15 +280,13 @@ protected:
     // TODO: test with buf_size = 1, 2, 3, etc.
     static const size_t buf_size = 4096;
     char input_buf[buf_size];
-    char output_buf[buf_size];
-    buffer::string received;
-    buffer::string output_data;
+    IOBuffer buffer;
     ProxyFrontend &frontend;
 
 public:
     ProxyBackend(ProxyFrontend& frontend_, struct ev_loop* event_loop_);
 
-    bool connect(const char* output_end, const char* host, uint32_t port);
+    bool connect(const char* host, uint32_t port);
 
     void read_callback() override;
     void write_callback() override;
@@ -192,20 +299,30 @@ class ProxyFrontend :
     public virtual non_copyable // because of references in HTTPParser
 {
     friend class ProxyBackend;
+
+    enum Progress
+    {
+        REQUEST_STARTED = 0,
+        REQUEST_HEAD_FINISHED,
+        REQUEST_FINISHED,
+        RESPONSE_STARTED,
+        RESPONSE_HEAD_FINISHED,
+        RESPONSE_FINISHED
+    };
+
 protected:
     static const size_t buf_size = 4096;
     char input_buf[buf_size];
-    buffer::string received;
-    buffer::string output_data;
+    IOBuffer buffer;
     ProxyBackend backend;
     HTTPParser parser;
     ssize_t sent_size = 0;
+    Progress progress = REQUEST_STARTED;
 
 public:
     ProxyFrontend(struct ev_loop* event_loop_, int conn_fd);
 
     void read_callback() override;
-    void read_body_callback();
     void write_callback() override;
 };
 
