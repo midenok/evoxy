@@ -90,7 +90,7 @@ public:
 
     void release()
     {
-        delete dynamic_cast<Object *>(this);
+        delete static_cast<Object *>(this);
     }
 };
 

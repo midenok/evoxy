@@ -25,21 +25,28 @@ private:
     buffer::string scan_buf_store;
     buffer::string found_line;
 
+    template <class STRING>
+    bool get_header_value(STRING& value, size_t& cl);
+
 public:
     buffer::string start_line;
     buffer::string method;
     buffer::string request_uri;
     buffer::string http_version;
     buffer::string host;
+    buffer::string content_length;
+    buffer::istring transfer_encoding;
+
     const char* host_cstr;
+    char host_terminator; // currently unused
     uint32_t port = 80;
-    char host_terminator;
+    uint32_t clength = 0;
+    bool chunked_body = false;
 
     bool next_line();
     Status parse_request_line();
     Status parse_header_line();
 
-public:
     HTTPParser(buffer::string &input_buf_, buffer::string output_buf_) :
         parse_line { &HTTPParser::parse_request_line },
         input_buf { input_buf_ },

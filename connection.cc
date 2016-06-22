@@ -51,6 +51,7 @@ void ProxyFrontend::read_callback()
             return;
         }
     }
+
     HTTPParser::Status s = parser({ received.end(), recv_size });
 
     received.grow(recv_size);
@@ -64,7 +65,10 @@ void ProxyFrontend::read_callback()
             return;
         }
         debug("Got request ", parser.request_uri);
-        stop_events(EV_READ);
+
+        // We can't disable READ, because any time client can tear connection.
+        // In this case we need to tear backend ASAP!
+        // stop_events(EV_READ);
 
         output_data = backend.received;
         if (backend.connect(parser.output_end(), parser.host_cstr, parser.port)) {
@@ -88,6 +92,11 @@ void ProxyFrontend::read_callback()
         release();
         return;
     }
+}
+
+void ProxyFrontend::read_body_callback()
+{
+    
 }
 
 // TODO: code is mostly duplicated!

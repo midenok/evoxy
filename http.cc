@@ -7,7 +7,9 @@ const std::string CRLF("\r\n");
 const std::string WSP("\t ");
 const std::string LWSP("\t \r\n");
 const std::string HOST("host");
-const std::string UA("user-agent");
+const std::string CONTENT_LENGTH("content-length");
+const std::string TRANSFER_ENCODING("transfer-encoding");
+const std::string CHUNKED("chunked");
 
 bool HTTPParser::next_line()
 {
@@ -89,6 +91,25 @@ HTTPParser::parse_request_line()
     return CONTINUE;
 }
 
+template <class STRING>
+bool
+HTTPParser::get_header_value(STRING& value, size_t& cl)
+{
+    ++cl;
+    if (&found_line[cl] >= found_line.end() - CRLF.size()) {
+        debug("Wrong header line: no value!");
+        return true;
+    }
+
+    size_t val = found_line.find_first_not_of(LWSP, cl);
+    if (val == STRING::npos) {
+        debug("Wrong header line: no value (2)!");
+        return true;
+    }
+    value.assign(&found_line[val], found_line.end() - CRLF.size());
+    return false;
+}
+
 HTTPParser::Status
 HTTPParser::parse_header_line()
 {
@@ -113,36 +134,42 @@ HTTPParser::parse_header_line()
     found_line.copy(output_buf);
     output_buf.shrink_front(found_line.size());
 
+    // TODO: optimization: eliminate uppercasing of static strings
     buffer::istring name(found_line.begin(), cl);
 
-    if (name != HOST) {
-        return CONTINUE;
-    }
-    ++cl;
-    if (&found_line[cl] >= found_line.end() - CRLF.size()) {
-        debug("Wrong header line: no value!");
-        return TERMINATE;
-    }
+    if (name == HOST) {
+        if (get_header_value(host, cl))
+            return TERMINATE;
 
-    size_t val = found_line.find_first_not_of(LWSP, cl);
-    if (val == buffer::string::npos) {
-        debug("Wrong header line: no value (2)!");
-        return TERMINATE;
+        cl = host.find(':');
+        if (cl != buffer::string::npos) {
+            host.assign(host.begin(), &host[cl]);
+            if (++cl < host.size()) {
+                buffer::string port_(&host[cl], host.end());
+                port = buffer::stoi(port_);
+            }
+        }
+        // fix host terminator to make getaddrinfo happy
+        assert(host.end() < found_line.end());
+        host_terminator = *host.end();
+        *const_cast<char*>(host.end()) = 0;
+        host_cstr = host.begin();
     }
-    host.assign(&found_line[val], found_line.end() - CRLF.size());
-    cl = host.find(':');
-    if (cl != buffer::string::npos) {
-        host.assign(host.begin(), &host[cl]);
-        if (++cl < host.size()) {
-            buffer::string port_(&host[cl], host.end());
-            port = buffer::stoi(port_);
+    else if (name == CONTENT_LENGTH) {
+        if (get_header_value(content_length, cl))
+            return TERMINATE;
+
+        clength = buffer::stoi(content_length);
+    }
+    else if (name == TRANSFER_ENCODING) {
+        if (get_header_value(transfer_encoding, cl))
+            return TERMINATE;
+
+        if (transfer_encoding == CHUNKED) {
+            chunked_body = true;
         }
     }
-    // fix host terminator to make getaddrinfo happy
-    assert(host.end() < found_line.end());
-    host_terminator = *host.end();
-    *const_cast<char*>(host.end()) = 0;
-    host_cstr = host.begin();
+
     return CONTINUE;
 }
 

@@ -82,6 +82,7 @@ private:
             if (self->read_expected) {
                 self->read_callback();
             } else {
+                // FIXME: is it needed?
                 self->read_unexpected();
             }
         }
@@ -181,7 +182,6 @@ public:
     bool connect(const char* output_end, const char* host, uint32_t port);
 
     void read_callback() override;
-
     void write_callback() override;
 };
 
@@ -205,6 +205,7 @@ public:
     ProxyFrontend(struct ev_loop* event_loop_, int conn_fd);
 
     void read_callback() override;
+    void read_body_callback();
     void write_callback() override;
 };
 
