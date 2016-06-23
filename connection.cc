@@ -63,8 +63,10 @@ void ProxyFrontend::read_callback()
         break;
     }
 
-    if (progress < REQUEST_HEAD_FINISHED) {
-        HTTPParser::Status s = parser(recv_chunk);
+    HTTPParser::Status s;
+    switch (progress) {
+    case REQUEST_STARTED:
+        s = parser.parse_head(recv_chunk);
 
         switch (s) {
         case HTTPParser::HEAD_FINISHED: // reached request end
@@ -78,16 +80,14 @@ void ProxyFrontend::read_callback()
                 REQUEST_FINISHED :
                 REQUEST_HEAD_FINISHED);
 
-            // We can't disable READ, because any time client can tear connection.
-            // In this case we need to tear backend ASAP!
-            // stop_events(EV_READ);
-
-            buffer.assign(buffer.end(), buffer.end()); // head is already in backend
             if (backend.connect(parser.host_cstr, parser.port)) {
                 debug("Backend connection failed!");
                 release();
                 return;
             }
+
+            if (!buffer.empty())
+                recv_chunk = buffer;
 
             break;
         case HTTPParser::TERMINATE:
@@ -95,13 +95,23 @@ void ProxyFrontend::read_callback()
             release();
             return;
         default:
-            break;
+            return;
         } // switch (HTTPParser::Status)
-    } // if (progress < REQUEST_HEAD_FINISHED)
 
-    if (progress == REQUEST_FINISHED) {
-        stop_all_events();
-    }
+        if (progress == REQUEST_FINISHED)
+            goto REQUEST_FINISHED;
+
+    case REQUEST_HEAD_FINISHED:
+        if (parser.chunked)
+            s = parser.parse_body(recv_chunk);
+
+    case REQUEST_FINISHED:
+    REQUEST_FINISHED:
+        // We can't disable READ, because any time client can tear connection.
+        // In this case we need to tear backend ASAP!
+        // stop_events(EV_READ);
+        stop_all_events(); // FIXME: wrong!
+    } // switch (progress)
 }
 
 void ProxyFrontend::write_callback()

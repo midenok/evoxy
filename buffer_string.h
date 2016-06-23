@@ -4,6 +4,7 @@
 #include <ostream>
 #include <iterator>
 #include <locale>
+#include <climits>
 
 namespace buffer
 {
@@ -2151,17 +2152,122 @@ throw ()
         basic_string<CharT, Traits>(ptr, count), pos);
 }
 
-inline int stoi(const string& str, size_t *idx = 0)
+
+inline long stol(const string& str, size_t *idx = 0, int base = 10)
 {	// convert string to int
-    int x = 0;
-    size_t n = 0;
-    while (&str[n] != str.end() && isdigit(str[n])) {
-        x = x * 10 + (str[n] - '0');
-        n++;
+    register const char *s = str.begin();
+    register const char *end = str.end();
+    register unsigned long acc;
+    register int c;
+    register unsigned long cutoff;
+    register int neg = 0, any, cutlim;
+
+    errno = 0;
+
+    if (s == end) {
+        errno = EINVAL;
+        return 0;
     }
-    if (idx)
-        *idx = n;
-    return x;
+
+    c = *s;
+
+    if (c == '-') {
+        neg = 1;
+        if (++s == end) {
+            errno = EINVAL;
+            return 0;
+        }
+    } else if (c == '+') {
+        if (++s == end) {
+            errno = EINVAL;
+            return 0;
+        }       
+    }
+
+    /*
+     * Compute the cutoff value between legal numbers and illegal
+     * numbers.  That is the largest legal value, divided by the
+     * base.  An input number that is greater than this value, if
+     * followed by a legal input character, is too big.  One that
+     * is equal to this value may be valid or not; the limit
+     * between valid and invalid numbers is then based on the last
+     * digit.  For instance, if the range for longs is
+     * [-2147483648..2147483647] and the input base is 10,
+     * cutoff will be set to 214748364 and cutlim to either
+     * 7 (neg==0) or 8 (neg==1), meaning that if we have accumulated
+     * a value > 214748364, or equal but the next digit is > 7 (or 8),
+     * the number is too big, and we will return a range error.
+     *
+     * Set any if any `digits' consumed; make it negative to indicate
+     * overflow.
+     */
+    static const unsigned long cutoff_neg_10 = -(unsigned long)LONG_MIN / 10;
+    static const unsigned long cutoff_10 = LONG_MAX / 10;
+    static const int cutlim_neg_10 = -(unsigned long) LONG_MIN % 10;
+    static const int cutlim_10 = LONG_MAX % 10;
+    static const unsigned long cutoff_neg_16 = -(unsigned long) LONG_MIN / 16;
+    static const unsigned long cutoff_16 = LONG_MAX / 16;
+    static const int cutlim_neg_16 = -(unsigned long) LONG_MIN % 16;
+    static const int cutlim_16 = LONG_MAX % 16;
+
+    switch(base) {
+    case 10:
+        if (neg) {
+            cutoff = cutoff_neg_10;
+            cutlim = cutlim_neg_10;
+        } else {
+            cutoff = cutoff_10;
+            cutlim = cutlim_10;
+        }
+        break;
+    case 16:
+        if (neg) {
+            cutoff = cutoff_neg_16;
+            cutlim = cutlim_neg_16;
+        } else {
+            cutoff = cutoff_16;
+            cutlim = cutlim_16;
+        }
+        break;
+    default:
+        cutoff = neg ? -(unsigned long) LONG_MIN : LONG_MAX;
+        cutlim = cutoff % (unsigned long) base;
+        cutoff /= (unsigned long) base;
+    }
+
+    for (acc = 0, any = 0; s < end; s++) {
+        c = *s;
+
+        if (isdigit(c))
+            c -= '0';
+        else if (isalpha(c))
+            c -= isupper(c) ? 'A' - 10 : 'a' - 10;
+        else
+            break;
+
+        if (c >= base)
+            break;
+
+        if (any < 0 || acc > cutoff || acc == cutoff && c > cutlim)
+            any = -1;
+        else {
+            any = 1;
+            acc *= base;
+            acc += c;
+        }
+    }
+
+    if (any < 0) {
+        acc = neg ? LONG_MIN : LONG_MAX;
+        errno = ERANGE;
+    } else if (any == 0) {
+        errno = EINVAL;
+    } else if (neg)
+        acc = -acc;
+
+    if (idx != 0)
+        *idx = s - str.begin();
+    return acc;
 }
 }
 

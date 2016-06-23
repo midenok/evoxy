@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.2)
 
-include_directories(${CMAKE_CURRENT_BINARY_DIR})
+include_directories(${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
 add_executable(udtproxy main.cc http.cc connection.cc udtproxy.c threads.cc)
 target_link_libraries(udtproxy -lopts -lpthread -lev)
 
@@ -14,3 +14,5 @@ add_custom_command(OUTPUT udtproxy.c udtproxy.h COMMAND autogen ${CMAKE_CURRENT_
 if (CYGWIN)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--image-base -Wl,0x10000000" )
 endif (CYGWIN)
+
+add_subdirectory(test)
