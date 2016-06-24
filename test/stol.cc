@@ -37,6 +37,7 @@ void check(const char * in, size_t base, long answer_num, size_t answer_pos = st
     }
 }
 
+
 int main()
 {
     check("ff", 16, 0xff);
@@ -52,5 +53,7 @@ int main()
     check("-7FfFfFfFfFfFfFfF", 16, -0x7fffffffffffffff);
     check("-8000000000000000", 16, LONG_MIN, 17);
     check("-8000000000000001", 16, LONG_MIN, 17, ERANGE);
+    check("800000000000000000000", 16, LONG_MAX, 16, ERANGE);
+    check("100000000000000000000", 16, LONG_MAX, 17, ERANGE);
     std::cout << "Passed " << check_invocation << " checks.\n";
 }

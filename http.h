@@ -40,14 +40,9 @@ public:
 
     const char* host_cstr;
     char host_terminator; // currently unused
-    uint32_t port = 80;
-    uint32_t clength = 0;
-    bool chunked = false;
-
-    size_t skip_chunk;
-    static const int max_marker = 16;
-    char chunk_marker[max_marker];
-    size_t marker_stored = 0;
+    uint32_t port;
+    uint32_t clength;
+    bool chunked;
 
     bool next_line();
     Status parse_request_line();
@@ -56,6 +51,29 @@ public:
     HTTPParser(IOBuffer &input_buf_, IOBuffer &output_buf_);
     Status parse_head(buffer::string &recv_chunk);
     Status parse_body(buffer::string &recv_chunk);
+
+private:
+    size_t skip_chunk;
+    size_t marker_hoarder;
+
+    enum MarkerSearch
+    {
+        NO_SEARCH = 0,
+        CR_SEARCH = 1,
+        LF_SEARCH = 2
+    } marker_end_search;
+
+public:
+    // FIXME: reset() on RESPONSE_FINISHED
+    void reset() // reset state to initial
+    {
+        port = 80;
+        clength = 0;
+        chunked = false;
+        skip_chunk = 0;
+        marker_hoarder = 0;
+        marker_end_search = NO_SEARCH;
+    }
 };
 
 #endif // __cd_http_h

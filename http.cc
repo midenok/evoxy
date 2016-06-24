@@ -17,7 +17,9 @@ HTTPParser::HTTPParser(IOBuffer &input_buf_, IOBuffer &output_buf_) :
     parse_line { &HTTPParser::parse_request_line },
     input_buf { input_buf_ },
     output_buf { output_buf_ }
-{}
+{
+    reset();
+}
 
 bool HTTPParser::copy_found_line()
 {
@@ -229,10 +231,42 @@ HTTPParser::Status HTTPParser::parse_head(buffer::string &recv_chunk)
     return CONTINUE;
 }
 
+
 HTTPParser::Status HTTPParser::parse_body(buffer::string& recv_chunk)
 {
     assert(!recv_chunk.empty());
     while (!recv_chunk.empty()) {
+        if (marker_end_search) {
+            assert(marker_hoarder);
+            if (marker_end_search == CR_SEARCH) {
+                size_t cr = recv_chunk.find_first_of('\r');
+                if (cr == buffer::string::npos)
+                    return CONTINUE;
+                if (cr == recv_chunk.size() - 1) {
+                    marker_end_search = LF_SEARCH;
+                    return CONTINUE;
+                }
+                if (recv_chunk[cr + 1] == '\n') {
+                    recv_chunk.shrink_front(cr + 2);
+                    goto found_marker_end;
+                }
+                recv_chunk.shrink_front(cr + 1);
+                continue;
+            }
+            // marker_end_search == LF_SEARCH;
+            if (recv_chunk[0] == '\n') {
+                recv_chunk.shrink_front(1);
+                found_marker_end:
+                marker_end_search = NO_SEARCH;
+                skip_chunk = marker_hoarder;
+                marker_hoarder = 0;
+                continue;
+            }
+            recv_chunk.shrink_front(1);
+            marker_end_search = CR_SEARCH;
+            continue;
+        }
+
         if (skip_chunk >= recv_chunk.size()) {
             skip_chunk -= recv_chunk.size();
             return CONTINUE;
@@ -241,9 +275,10 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string& recv_chunk)
         if (skip_chunk > 0) {
             recv_chunk.shrink_front(skip_chunk);
             skip_chunk = 0;
+            assert(marker_hoarder == 0);
         }
 
-        // Now we are at the beginning of new chunk marker and need to find CRLF
+        // Now we are at the start of chunk marker and need to find CRLF
         // to actually start skipping. But we have situation different (and worse)
         // than in parse_head()! Now the buffer is not permanent: it may be taken by ParseBackend
         // at any time! So the worst case scenario is: CR in the end of one buffer goes
@@ -251,36 +286,35 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string& recv_chunk)
         // actual marker also may be split by buffer boundaries. So, we need to collect it to some
         // dedicated place if we can't acknowledge its end in current recv_chunk.
 
-        size_t marker_free = max_marker - marker_stored;
-        if (recv_chunk.size() < marker_free + 1) {
-            size_t marker_end = recv_chunk.find_first_of(MARKER_TERMINATORS);
-            if (marker_end == buffer::string::npos) {
-                recv_chunk.copy(chunk_marker + marker_stored);
-                marker_stored += recv_chunk.size();
-                return CONTINUE;
-            }
-            buffer::string marker;
-            if (marker_stored) {
-                recv_chunk.copy(chunk_marker + marker_stored, marker_end);
-                marker_stored += marker_end;
-                marker.assign(chunk_marker, marker_stored);
-            } else {
-                marker.assign(recv_chunk.begin(), marker_end);
-            }
-            {
-                size_t len;
-                skip_chunk = buffer::stol(marker, &len, 16);
-                if (errno) {
-                    debug("Wrong chunk marker: ", strerror(errno));
-                    return TERMINATE;
-                } else if (len != marker_stored) {
-                    debug("Wrong chunk marker: '", marker, "' is not number!");
-                    return TERMINATE;
-                }
-            }
-            recv_chunk.shrink_front(marker_stored);
-            continue;
+        size_t digits;
+        long marker_part = buffer::stol(recv_chunk, &digits, 16);
+
+        if (errno) {
+            debug("Wrong chunk marker: ", strerror(errno));
+            return TERMINATE;
         }
-        // FIXME: otherwise ...
-    }
+
+        if (recv_chunk.size() > digits && recv_chunk[digits] != ';' && recv_chunk[digits] != '\r') {
+            debug("Wrong chunk marker: wrong size terminator");
+        }
+
+        if (marker_hoarder) {
+            unsigned bits = digits << 3; // bits to shift
+            if (marker_hoarder > SIZE_MAX >> bits) {
+                debug("Wrong chunk marker: too big!");
+                return TERMINATE;
+            }
+            marker_hoarder <<= bits;
+            marker_hoarder += marker_part;
+        } else {
+            marker_hoarder = marker_part;
+        }
+
+        if (digits == recv_chunk.size()) {
+            return CONTINUE;
+        }
+
+        marker_end_search = CR_SEARCH;
+        recv_chunk.shrink_front(digits);
+    } // while (!recv_chunk.empty())
 }

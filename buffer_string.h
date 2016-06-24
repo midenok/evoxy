@@ -2248,13 +2248,14 @@ inline long stol(const string& str, size_t *idx = 0, int base = 10)
         if (c >= base)
             break;
 
-        if (any < 0 || acc > cutoff || acc == cutoff && c > cutlim)
-            any = -1;
-        else {
-            any = 1;
-            acc *= base;
-            acc += c;
+        if (acc > cutoff || acc == cutoff && c > cutlim) {
+            s++; any = -1;
+            break;
         }
+
+        any = 1;
+        acc *= base;
+        acc += c;
     }
 
     if (any < 0) {
