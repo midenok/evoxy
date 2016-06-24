@@ -278,7 +278,7 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string& recv_chunk)
             assert(marker_hoarder == 0);
         }
 
-        // Now we are at the start of chunk marker and need to find CRLF
+        // Now we are at the start (or in the middle) of chunk marker and need to find CRLF
         // to actually start skipping. But we have situation different (and worse)
         // than in parse_head()! Now the buffer is not permanent: it may be taken by ParseBackend
         // at any time! So the worst case scenario is: CR in the end of one buffer goes
@@ -296,6 +296,7 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string& recv_chunk)
 
         if (recv_chunk.size() > digits && recv_chunk[digits] != ';' && recv_chunk[digits] != '\r') {
             debug("Wrong chunk marker: wrong size terminator");
+            return TERMINATE;
         }
 
         if (marker_hoarder) {
