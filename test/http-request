@@ -40,13 +40,32 @@ Transfer-Encoding: chunked\r
 \r
 4\r
 abc
-\r~~~
+\r
+0\r
+X-Trailer-Header: nothing\r
+X-Trailer-Header2: something\r
+\r
+EOF
+,
+
+<<EOF
+POST / HTTP/1.1\r
+User-Agent: Wget/1.17.1 (cygwin)\r
+Accept: */*\r
+Accept-Encoding: identity\r
+Host: 127.0.0.1\r
+Connection: Keep-Alive\r
+Transfer-Encoding: chunked\r
+\r
+4\r
+abc
+\r
 0\r
 \r
 EOF
 );
 
-my $r = 1;
+my $r = 2;
 my @chunks = split('~~~', $request[$r]);
 
 $| = 1;

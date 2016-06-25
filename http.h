@@ -50,19 +50,25 @@ public:
     Status parse_head(buffer::string &recv_chunk);
     Status parse_body(buffer::string &recv_chunk);
 
+    enum CRLFSearch
+    {
+        NO_SEARCH = 0,
+        MARKER_CR_SEARCH = 1, // ++ must result in MARKER_LF_EXPECT
+        MARKER_LF_EXPECT = 2,
+        CHUNK_CR_EXPECT = 3,
+        CHUNK_LF_EXPECT = 4,
+        TRAILER_CR_SEARCH = 5, // ++ must result in TRAILER_LF_EXPECT
+        TRAILER_LF_EXPECT = 6,
+        TRAILER_CR2_EXPECT = 7,
+        TRAILER_LF2_EXPECT = 8
+    };
+
 private:
     size_t skip_chunk;
     size_t marker_hoarder;
     bool body_end;
 
-    enum
-    {
-        NO_SEARCH = 0,
-        MARKER_CR_SEARCH = 1,
-        MARKER_LF_EXPECT = 2,
-        CHUNK_CR_EXPECT = 3,
-        CHUNK_LF_EXPECT = 4
-    } crlf_search;
+    CRLFSearch crlf_search;
 
 public:
     // FIXME: reset() on RESPONSE_FINISHED

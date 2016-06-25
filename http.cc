@@ -264,7 +264,7 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string& recv_chunk)
                 if (body_end) {
                     // Got trailer headers, need CRLFCRLF to get to actual message end.
                     recv_chunk.shrink_front(1);
-                    // FIXME: crlf_search = TRAILER_CR_SEARCH;
+                    crlf_search = TRAILER_CR_SEARCH;
                     continue;
                 }
                 debug("Wrong chunk terminator: not CRLF (CR not matched)!");
@@ -278,11 +278,46 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string& recv_chunk)
                 debug("Wrong chunk terminator: not CRLF (LF not matched)!");
                 return TERMINATE;
             }
-            if (body_end)
+            if (body_end) {
+                assert(recv_chunk.size() == 1);
                 return PROCEED;
+            }
             crlf_search = NO_SEARCH;
             recv_chunk.shrink_front(1);
             continue;
+        case TRAILER_CR_SEARCH:
+            cr = recv_chunk.find_first_of('\r');
+            if (cr == buffer::string::npos)
+                return CONTINUE;
+            recv_chunk.shrink_front(cr + 1);
+            crlf_search = TRAILER_LF_EXPECT;
+            continue;
+        case TRAILER_LF_EXPECT:
+            if (recv_chunk[0] != '\n') {
+                recv_chunk.shrink_front(1);
+                crlf_search = TRAILER_CR_SEARCH;
+                continue;
+            }
+            recv_chunk.shrink_front(1);
+            crlf_search = TRAILER_CR2_EXPECT;
+            continue;
+        case TRAILER_CR2_EXPECT:
+            if (recv_chunk[0] != '\r') {
+                recv_chunk.shrink_front(1);
+                crlf_search = TRAILER_CR_SEARCH;
+                continue;
+            }
+            recv_chunk.shrink_front(1);
+            crlf_search = TRAILER_LF2_EXPECT;
+            continue;
+        case TRAILER_LF2_EXPECT:
+            if (recv_chunk[0] != '\n') {
+                recv_chunk.shrink_front(1);
+                crlf_search = TRAILER_CR_SEARCH;
+                continue;
+            }
+            assert(recv_chunk.size() == 1);
+            return PROCEED;
         case NO_SEARCH:
         default:
             break;
