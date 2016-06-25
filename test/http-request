@@ -14,7 +14,7 @@ connect( SOCKET, pack_sockaddr_in($port, inet_aton($host)))
    or die "Can't connect to ${host}:${port}!\n";
 
 
-my $request=<<EOF;
+my @request=(<<EOF
 GET / HTTP/1.1\r
 User-Agent: Wget/1.17.1 (cygwin)\r
 Accept: */*\r
@@ -23,12 +23,31 @@ X-Multi-Line-Header: line 1\r
    \t \t   \t line 3\r
  line 4\r
 Accept-Encoding: identity\r
-Host: lenta.ru\r
+Host: 127.0.0.1\r
 Connection: Keep-Alive\r
 ~~~\r
 EOF
+,
 
-my @chunks = split('~~~', $request);
+<<EOF
+POST / HTTP/1.1\r
+User-Agent: Wget/1.17.1 (cygwin)\r
+Accept: */*\r
+Accept-Encoding: identity\r
+Host: 127.0.0.1\r
+Connection: Keep-Alive\r
+Transfer-Encoding: chunked\r
+\r
+4\r
+abc
+\r~~~
+0\r
+\r
+EOF
+);
+
+my $r = 1;
+my @chunks = split('~~~', $request[$r]);
 
 $| = 1;
 for my $chunk (@chunks) {
@@ -37,6 +56,5 @@ for my $chunk (@chunks) {
         die "Sent ${sent} bytes instead of ". length($chunk);
     }
     print $chunk;
-    sleep 1;
 }
 close SOCKET or die "close: $!";

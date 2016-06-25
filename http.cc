@@ -261,6 +261,12 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string& recv_chunk)
             continue;
         case CHUNK_CR_EXPECT:
             if (recv_chunk[0] != '\r') {
+                if (body_end) {
+                    // Got trailer headers, need CRLFCRLF to get to actual message end.
+                    recv_chunk.shrink_front(1);
+                    // FIXME: crlf_search = TRAILER_CR_SEARCH;
+                    continue;
+                }
                 debug("Wrong chunk terminator: not CRLF (CR not matched)!");
                 return TERMINATE;
             }
@@ -284,6 +290,9 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string& recv_chunk)
 
         if (skip_chunk >= recv_chunk.size()) {
             skip_chunk -= recv_chunk.size();
+            if (skip_chunk == 0) {
+                crlf_search = CHUNK_CR_EXPECT;
+            }
             return CONTINUE;
         }
 
@@ -292,6 +301,11 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string& recv_chunk)
             recv_chunk.shrink_front(skip_chunk);
             skip_chunk = 0;
             crlf_search = CHUNK_CR_EXPECT;
+            continue;
+        }
+
+        if (marker_hoarder && (recv_chunk[0] == '\r' || recv_chunk[0] == ';')) {
+            crlf_search = MARKER_CR_SEARCH;
             continue;
         }
 
