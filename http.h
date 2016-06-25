@@ -15,8 +15,7 @@ public:
         // Continue current phase
         CONTINUE,
         // Proceed to next phase
-        HEAD_FINISHED,
-        BODY_FINISHED
+        PROCEED
     };
 
 private:
@@ -47,7 +46,6 @@ public:
     bool next_line();
     Status parse_request_line();
     Status parse_header_line();
-    Status parse_chunks();
     HTTPParser(IOBuffer &input_buf_, IOBuffer &output_buf_);
     Status parse_head(buffer::string &recv_chunk);
     Status parse_body(buffer::string &recv_chunk);
@@ -55,13 +53,16 @@ public:
 private:
     size_t skip_chunk;
     size_t marker_hoarder;
+    bool body_end;
 
-    enum MarkerSearch
+    enum
     {
         NO_SEARCH = 0,
-        CR_SEARCH = 1,
-        LF_SEARCH = 2
-    } marker_end_search;
+        MARKER_CR_SEARCH = 1,
+        MARKER_LF_EXPECT = 2,
+        CHUNK_CR_EXPECT = 3,
+        CHUNK_LF_EXPECT = 4
+    } crlf_search;
 
 public:
     // FIXME: reset() on RESPONSE_FINISHED
@@ -72,7 +73,8 @@ public:
         chunked = false;
         skip_chunk = 0;
         marker_hoarder = 0;
-        marker_end_search = NO_SEARCH;
+        crlf_search = NO_SEARCH;
+        body_end = false;
     }
 };
 

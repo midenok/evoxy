@@ -138,7 +138,7 @@ HTTPParser::parse_header_line()
             return TERMINATE;
         input_buf.assign(found_line.end(), input_buf.end());
         output_buf.assign(output_buf.buffer_begin(), output_buf.end());
-        return HEAD_FINISHED;
+        return PROCEED;
     }
 
     size_t cl = found_line.find(':');
@@ -192,16 +192,6 @@ HTTPParser::parse_header_line()
     return CONTINUE;
 }
 
-HTTPParser::Status
-HTTPParser::parse_chunks()
-{
-    if (found_line.size() == CRLF.size()) {
-        return BODY_FINISHED;
-    }
-    size_t num_end;
-    long chunk_size = buffer::stol(found_line, &num_end, 16);
-    return CONTINUE;
-}
 
 HTTPParser::Status HTTPParser::parse_head(buffer::string &recv_chunk)
 {
@@ -236,35 +226,60 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string& recv_chunk)
 {
     assert(!recv_chunk.empty());
     while (!recv_chunk.empty()) {
-        if (marker_end_search) {
-            assert(marker_hoarder);
-            if (marker_end_search == CR_SEARCH) {
-                size_t cr = recv_chunk.find_first_of('\r');
-                if (cr == buffer::string::npos)
-                    return CONTINUE;
-                if (cr == recv_chunk.size() - 1) {
-                    marker_end_search = LF_SEARCH;
-                    return CONTINUE;
-                }
-                if (recv_chunk[cr + 1] == '\n') {
-                    recv_chunk.shrink_front(cr + 2);
-                    goto found_marker_end;
-                }
-                recv_chunk.shrink_front(cr + 1);
-                continue;
+        size_t cr;
+        switch (crlf_search) {
+        case MARKER_CR_SEARCH:
+            cr = recv_chunk.find_first_of('\r');
+            if (cr == buffer::string::npos)
+                return CONTINUE;
+            if (cr == recv_chunk.size() - 1) {
+                crlf_search = MARKER_LF_EXPECT;
+                return CONTINUE;
             }
-            // marker_end_search == LF_SEARCH;
+            if (recv_chunk[cr + 1] == '\n') {
+                recv_chunk.shrink_front(cr + 2);
+                goto found_marker_end;
+            }
+            recv_chunk.shrink_front(cr + 1);
+            continue;
+        case MARKER_LF_EXPECT:
             if (recv_chunk[0] == '\n') {
                 recv_chunk.shrink_front(1);
-                found_marker_end:
-                marker_end_search = NO_SEARCH;
-                skip_chunk = marker_hoarder;
-                marker_hoarder = 0;
+            found_marker_end:
+                if (marker_hoarder == 0) {
+                    crlf_search = CHUNK_CR_EXPECT;
+                    body_end = true;
+                } else {
+                    crlf_search = NO_SEARCH;
+                    skip_chunk = marker_hoarder;
+                    marker_hoarder = 0;
+                }
                 continue;
             }
             recv_chunk.shrink_front(1);
-            marker_end_search = CR_SEARCH;
+            crlf_search = MARKER_CR_SEARCH;
             continue;
+        case CHUNK_CR_EXPECT:
+            if (recv_chunk[0] != '\r') {
+                debug("Wrong chunk terminator: not CRLF (CR not matched)!");
+                return TERMINATE;
+            }
+            crlf_search = CHUNK_LF_EXPECT;
+            recv_chunk.shrink_front(1);
+            continue;
+        case CHUNK_LF_EXPECT:
+            if (recv_chunk[0] != '\n') {
+                debug("Wrong chunk terminator: not CRLF (LF not matched)!");
+                return TERMINATE;
+            }
+            if (body_end)
+                return PROCEED;
+            crlf_search = NO_SEARCH;
+            recv_chunk.shrink_front(1);
+            continue;
+        case NO_SEARCH:
+        default:
+            break;
         }
 
         if (skip_chunk >= recv_chunk.size()) {
@@ -273,9 +288,11 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string& recv_chunk)
         }
 
         if (skip_chunk > 0) {
+            assert(marker_hoarder == 0);
             recv_chunk.shrink_front(skip_chunk);
             skip_chunk = 0;
-            assert(marker_hoarder == 0);
+            crlf_search = CHUNK_CR_EXPECT;
+            continue;
         }
 
         // Now we are at the start (or in the middle) of chunk marker and need to find CRLF
@@ -315,7 +332,8 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string& recv_chunk)
             return CONTINUE;
         }
 
-        marker_end_search = CR_SEARCH;
+        crlf_search = MARKER_CR_SEARCH;
         recv_chunk.shrink_front(digits);
     } // while (!recv_chunk.empty())
+    return CONTINUE;
 }

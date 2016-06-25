@@ -69,7 +69,7 @@ void ProxyFrontend::read_callback()
         s = parser.parse_head(recv_chunk);
 
         switch (s) {
-        case HTTPParser::HEAD_FINISHED: // reached request end
+        case HTTPParser::PROCEED: // reached head end
             if (parser.host.empty()) {
                 debug("No Host header in request!");
                 release();
@@ -94,6 +94,7 @@ void ProxyFrontend::read_callback()
             error("Parsing HTTP request failed!");
             release();
             return;
+        case HTTPParser::CONTINUE:
         default:
             return;
         } // switch (HTTPParser::Status)
@@ -102,8 +103,21 @@ void ProxyFrontend::read_callback()
             goto REQUEST_FINISHED;
 
     case REQUEST_HEAD_FINISHED:
-        if (parser.chunked)
+        if (parser.chunked) {
             s = parser.parse_body(recv_chunk);
+            switch (s) {
+            case HTTPParser::PROCEED: // reached body end
+                progress = REQUEST_FINISHED;
+                goto REQUEST_FINISHED;
+            case HTTPParser::TERMINATE:
+                error("Parsing HTTP request body failed!");
+                release();
+                return;
+            case HTTPParser::CONTINUE:
+            default:
+                return;
+            } // switch (HTTPParser::Status)
+        }
 
     case REQUEST_FINISHED:
     REQUEST_FINISHED:
