@@ -23,7 +23,6 @@ class OnEventLoop :
     public virtual non_copyable
 {
 protected:
-    bool read_expected = true;
     ev_io conn_watcher;
 
 private:
@@ -44,48 +43,12 @@ private:
         }
     }
 
-    void read_unexpected()
-    {
-        char buf[1];
-        size_t recv_size = recv(conn_watcher.fd, buf, 1, 0);
-        if (recv_size == -1) {
-            switch (errno) {
-                case ENOTCONN:
-                    debug ("peer reset");
-                    if (async_task)
-                        terminate();
-                    else
-                        delete this;
-                    return;
-                case EAGAIN:
-                    return;
-                default:
-                    throw Errno("recv");
-            }
-        }
-        if (recv_size == 0)
-            debug("peer shutdown");
-        else
-            debug("unexpected read!");
-        if (async_task)
-            terminate();
-        else
-            delete this;
-        return;
-    }
-
     static void
     conn_callback (EV_P_ ev_io *w, int revents)
     {
         OnEventLoop *self = (OnEventLoop *)w->data;
-        if (revents & EV_READ) {
-            if (self->read_expected) {
-                self->read_callback();
-            } else {
-                // FIXME: is it needed?
-                self->read_unexpected();
-            }
-        }
+        if (revents & EV_READ)
+            self->read_callback();
         if (revents & EV_WRITE)
             self->write_callback();
     }
