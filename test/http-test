@@ -14,7 +14,8 @@ my %CONFIG = (
     listen_port => '8080',
     proxy_address => 'localhost:9000',
     server_threads => 1,
-    client_threads => 1
+    client_threads => 1,
+    raw_chunks_delay => 100 # usecs
 );
 
 my %OPTIONS = (
@@ -187,7 +188,6 @@ use threads;
 use threads::shared;
 use Storable qw[freeze thaw];
 
-use Data::Dumper;
 use HTTP::Daemon;
 use HTTP::Response;
 use HTTP::Status;
@@ -205,78 +205,44 @@ sub start
         LocalPort => $c->{'listen_port'},
         ReuseAddr => 1
     ) or die $c->{server_address}. ": $!\n";
+    print "Started HTTP server at " . $d->url . "\n";
 
     %Daemon = %${\*$d};
     $DaemonFD = fileno($d);
-    open SOCK, "+<&=$DaemonFD" or die $!;
+    open my $fh, "+<&=$DaemonFD" or die $!;
 
     $RunS = 1;
-    Threads::start(1, \&accept_thread);
     Threads::start($c->{server_threads}, \&worker_thread);
 }
 
 sub get_daemon
 {
-    open SOCK, "+<&=$DaemonFD" or die $!;
-    my $d = bless \*SOCK => 'HTTP::Daemon';
+    open my $fh, "+<&=$DaemonFD" or die $!;
+    my $d = bless $fh => 'HTTP::Daemon';
     %${\*$d} = %Daemon;
     return $d;
 }
 
-sub get_conn
-{
-    my $daemon = shift;
-    my $fd = shift;
-    open FD, "+<&=$fd" or die $!;
-    my $conn = bless \*FD => "HTTP::Daemon::ClientConn";
-    %${\*$conn} = %Daemon;
-    $${\*$conn}{httpd_daemon} = $daemon;
-    return $conn;
-}
-
-my @Conn :shared;
 my @Requests :shared;
 my %Responses :shared;
 my %ResponsesSent :shared;
-
-sub accept_thread
-{
-    my $d = get_daemon();
-    print "Started HTTP server at " . $d->url . "\n";
-
-    while ($RunS) {
-        my $conn = $d->accept;
-        last if $!{EINVAL};
-        die "accept: $!\n" unless $conn;
-        {
-            my $fd = fileno($conn);
-            open FD, "+<&=$fd" or die $!;
-            lock @Conn;
-            push @Conn, $fd;
-            cond_signal @Conn;
-        }
-    }
-}
 
 my $WorkerThreads :shared;
 $WorkerThreads = 0;
 
 sub worker_thread
 {
-    ++$WorkerThreads;
+    {lock $WorkerThreads;
+    ++$WorkerThreads;}
     my $d = get_daemon();
 
     loop:
     while ($RunS) {
-        my $conn_fd;
-        {
-            lock @Conn;
-            cond_wait @Conn
-                until @Conn || !$RunS;
-            last loop unless $RunS;
-            $conn_fd = shift @Conn;
-        }
-        my $conn = get_conn($d, $conn_fd);
+        my $conn = $d->accept;
+        last loop if $!{EINVAL};
+        die "accept: $!\n" unless $conn;
+
+        $conn->autoflush(1);
         my $req = $conn->get_request(1) or last;
         my $id = $req->header('X-Request-Id');
         {
@@ -301,9 +267,11 @@ sub worker_thread
             $ResponsesSent{$id} = $resp_frozen;
             cond_signal %ResponsesSent;
         }
-        $conn->close(); # FIXME: keepalives
+        shutdown($conn, 2); # FIXME: keepalives
     }
-    --$WorkerThreads;
+    {lock $WorkerThreads;
+    --$WorkerThreads;}
+    print "Exiting $WorkerThreads\n";
 }
 
 use Time::HiRes 'usleep';
@@ -313,14 +281,8 @@ sub stop
     $RunS = 0;
     shutdown(get_daemon(), 2);
     while ($WorkerThreads) {
-        {
-            lock @Conn;
-            cond_broadcast @Conn;
-        }
-        {
-            lock %Responses;
-            cond_broadcast %Responses;
-        }
+        lock %Responses;
+        cond_broadcast %Responses;
     } continue {
         usleep 1;
     }
@@ -373,7 +335,6 @@ sub set_response
 {
     my $resp = shift;
     my $id = shift;
-    $resp->header('X-Request-Id', $id);
     {
         lock %Responses;
         $Responses{$id} = freeze $resp;
@@ -383,8 +344,6 @@ sub set_response
 }
 
 =pod
-use constant HOSTNAME => qx{hostname};
-
 @SIG{$_} = sub {
     $RUN = 0;
 } for (qw[INT TERM HUP QUIT]);
@@ -395,6 +354,9 @@ use constant HOSTNAME => qx{hostname};
 package Client;
 use strict;
 use LWP  5.825;
+use Socket qw(:all);
+use Time::HiRes 'usleep';
+
 use threads;
 use threads::shared;
 use Storable qw[freeze thaw];
@@ -417,22 +379,26 @@ sub start
 my $ClientThreads :shared;
 $ClientThreads = 0;
 
+sub push_req_sent
+{
+    my $req = $_[0];
+    my $id = $req->header('X-Request-Id');
+    lock %ReqSent;
+    $ReqSent{$id} = freeze $req;
+    cond_signal %ReqSent;
+}
+
 sub client_thread
 {
-    ++$ClientThreads;
+    {lock $ClientThreads;
+    ++$ClientThreads;}
     my $c = Config::get();
     my $ua = LWP::UserAgent->new;
     if ($c->{proxy_address}) {
         $ua->proxy('http', $c->url('proxy_address'));
     }
 
-    $ua->add_handler(request_send => sub {
-        my $req = $_[0];
-        my $id = $req->header('X-Request-Id');
-        lock %ReqSent;
-        $ReqSent{$id} = freeze $req;
-        cond_signal %ReqSent;
-    });
+    $ua->add_handler(request_send => \&push_req_sent);
 
     loop:
     while ($RunC) {
@@ -442,14 +408,20 @@ sub client_thread
             cond_wait @Reqs
                 until @Reqs || !$RunC;
             last loop unless $RunC;
-            $req = thaw(shift @Reqs);
+            $req = shift @Reqs;
             if (@Reqs == MAX_REQS - 1) {
                 lock $ReqsFreed;
                 cond_signal $ReqsFreed;
             }
         }
 
-        my $resp = $ua->request($req);   #do it
+        eval { $req = thaw $req; };
+        my $resp;
+        if (ref $req) {
+            $resp = $ua->request($req);
+        } else {
+            $resp = raw_request($req);
+        }
         my $id = $resp->header('X-Request-Id');
         {
             lock @Resps;
@@ -457,10 +429,37 @@ sub client_thread
             cond_signal @Resps;
         }
     }
-    --$ClientThreads;
+    {lock $ClientThreads;
+    --$ClientThreads;}
 }
 
-use Time::HiRes 'usleep';
+sub raw_request
+{
+    my $c = Config::get();
+    my $req_raw = shift;
+    my @chunks = split('~~~', $req_raw);
+    my $req = HTTP::Request->parse(join('', @chunks));
+    push_req_sent($req);
+    my $host = $req->header('Host');
+    my $sock = IO::Socket::INET->new(
+        PeerAddr => $req->header('Host'),
+        Proto => 'tcp'
+    ) or die "connect: $!";
+    setsockopt($sock, IPPROTO_TCP, TCP_NODELAY, 1);
+    for my $chunk (@chunks) {
+        $sock->send($chunk);
+        usleep $c->{raw_chunks_delay};
+    }
+    my $resp_raw;
+    my $buf;
+    do {
+        defined $sock->recv($buf, 4096) # TODO: locks on Keep-Alive
+            or die "recv: $!";
+        $resp_raw .= $buf;
+    } while (length($buf));
+    my $resp = HTTP::Response->parse($resp_raw);
+    return $resp;
+}
 
 sub stop
 {
@@ -476,13 +475,14 @@ sub stop
 sub send_request
 {
     my $req = shift;
-    my $id = shift;
-    $req->header('X-Request-Id' => $id);
+    if (ref $req) {
+        $req = freeze $req;
+    }
     {
         lock @Reqs;
         cond_wait $ReqsFreed, @Reqs
             until @Reqs < MAX_REQS;
-        push @Reqs, freeze $req;
+        push @Reqs, $req;
         cond_signal @Reqs;
     }
 }
@@ -534,6 +534,59 @@ sub broadcast
 
 1;
 
+package Stopwatch;
+use Time::HiRes qw[gettimeofday tv_interval];
+
+sub new
+{
+    my $class = shift;
+    $class = (ref $class || $class);
+
+    my $self = bless {
+        start_time => shift,
+        stop_time => undef,
+        elapsed => undef
+    } => $class;
+
+    return $self;
+}
+
+sub start
+{
+    my $self = shift;
+    $self->{start_time} = [gettimeofday];
+}
+
+sub start_time
+{
+    my $self = shift;
+    return ref $self->{start_time} eq __PACKAGE__ ?
+        $self->{start_time}->start_time() :
+        $self->{start_time};
+}
+
+sub stop
+{
+    my $self = shift;
+    $self->{stop_time} = [gettimeofday];
+    $self->{elapsed} = tv_interval($self->start_time, $self->{stop_time});
+}
+
+sub print
+{
+    my $self = shift;
+    my $reqs = shift;
+    my $elpsd = $self->{elapsed};
+    my $reqs_per_sec = $reqs / $elpsd;
+    {
+        use integer;
+        $reqs_per_sec /= 1;
+    }
+    print "Finished in $elpsd secs\n", "$reqs_per_sec requests/sec\n";
+}
+
+1;
+
 package Tests;
 use strict;
 
@@ -541,9 +594,13 @@ use threads;
 use threads::shared;
 use Storable qw[freeze thaw];
 
-my $RequestId = 0;
+my $ReqId = 0;
+my $ReqDone :shared;
+$ReqDone = 0;
 my %Tests :shared;
 my $RunT :shared;
+
+my $Watch = Stopwatch->new();
 
 sub start
 {
@@ -556,13 +613,28 @@ sub run
 {   
     my $t = shift;
 
-    {
-        lock %Tests;
-        $Tests{$RequestId} = freeze $t;
+    $Watch->start;
+
+    for (my $n = 0; $n < 500; ++$n) {
+        {
+            lock %Tests;
+            $Tests{$ReqId} = freeze $t;
+        }
+        Server::set_response($t->response($ReqId), $ReqId);
+        # client send queue will block until less than MAX_REQS
+        Client::send_request($t->request($ReqId));
+        $ReqId++;
     }
-    Server::set_response($t->response(), $RequestId);
-    # client send queue will block until less than MAX_REQS
-    Client::send_request($t->request(), $RequestId);
+}
+
+sub wait
+{
+    lock %Tests;
+    cond_wait %Tests
+        while %Tests;
+
+    $Watch->stop;
+    $Watch->print($ReqDone);
 }
 
 my $CheckerThreads :shared;
@@ -570,7 +642,8 @@ $CheckerThreads = 0;
 
 sub request_checker_thread
 {
-    $CheckerThreads++;
+    {lock $CheckerThreads;
+    $CheckerThreads++;}
     while ($RunT) {
         my ($req, $id) = Server::get_request(\$RunT)
             or next;
@@ -578,20 +651,29 @@ sub request_checker_thread
             or next;
         check_message($sent, $req);
     }
-    $CheckerThreads--;
+    {lock $CheckerThreads;
+    $CheckerThreads--;}
 }
 
 sub response_checker_thread
 {
-    $CheckerThreads++;
+    {lock $CheckerThreads;
+    $CheckerThreads++;}
     while ($RunT) {
         my ($resp, $id) = Client::get_response(\$RunT)
             or next;
         my $sent = Server::get_response(\$RunT, $id)
             or next;
         check_message($sent, $resp);
+        {
+            lock %Tests;
+            delete $Tests{$id};
+            cond_signal %Tests;
+        }
+        ++$ReqDone;
     }
-    $CheckerThreads--;
+    {lock $CheckerThreads;
+    $CheckerThreads--;}
 }
 
 use Time::HiRes 'usleep';
@@ -620,6 +702,7 @@ sub check_message
             die "Received ${type} lacks header ${name}!\n";
         }
         my $expected = $sent->header($name);
+        $expected =~ s/[\r\n\t ]+/ /gm; # multi-line headers are catenated in HTTP::Daemon
         if ($val ne $expected) {
             die "Wrong ${type} header ${name}: ${val}, expected ${expected}\n";
         }
@@ -639,6 +722,8 @@ sub check_message
 1;
 
 package Test;
+use HTTP::Response;
+use HTTP::Status;
 
 sub new
 {
@@ -652,30 +737,16 @@ sub new
     return $self;
 }
 
-1;
-
-package Test::Simple;
-use parent 'Test';
-use strict;
-
-use HTTP::Request::Common;
-use HTTP::Response;
-use HTTP::Status;
-
-sub request
-{
-    my $self = shift;
-    my $c = $self->{conf};
-    my $url = $c->url('server_address');
-    return GET($url);
-}
-
 sub response
 {
+    my $self = shift;
+    my $request_id = shift;
+
     return HTTP::Response->new(
         RC_OK,
         undef,
         [
+            'X-Request-Id' => $request_id,
             'Content-Type' => 'text/plain',
             'Cache-Control' => 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0',
             'Pragma' => 'no-cache',
@@ -683,6 +754,52 @@ sub response
         ],
         "OK\n"
     );
+}
+
+1;
+
+package Test::Simple;
+use parent 'Test';
+use strict;
+
+use HTTP::Request::Common;
+
+sub request
+{
+    my $self = shift;
+    my $id = shift;
+    my $c = $self->{conf};
+    my $req = GET($c->url('server_address'));
+    $req->header('X-Request-Id' => $id);
+    return $req;
+}
+
+1;
+
+package Test::Raw;
+use parent 'Test';
+use strict;
+
+sub request
+{
+    my $self = shift;
+    my $request_id = shift;
+    my $c = $self->{conf};
+    my $req =<<EOF;
+GET / HTTP/1.1\r
+User-Agent: Wget/1.17.1 (cygwin)\r
+Accept: */*\r
+Host: $c->{server_address}\r
+X-Request-Id: ${request_id}\r
+X-Multi-Line-Header: line 1\r
+ line 2\r
+   \t \t   \t line 3\r
+ line 4\r
+Accept-Encoding: identity\r
+Connection: Close\r
+~~~\r
+EOF
+    return $req;
 }
 
 1;
@@ -695,9 +812,7 @@ Tests::start();
 
 my $t = Test::Simple->new();
 Tests::run($t);
-
-# sleep(1);
-# sleep(600);
+Tests::wait();
 
 Tests::stop();
 Client::stop();
