@@ -15,7 +15,11 @@ my %CONFIG = (
     proxy_address => 'localhost:9000',
     server_threads => 1,
     client_threads => 1,
-    raw_chunks_delay => 100 # usecs
+    raw_chunks_delay => 100, # usecs
+    max_requests => 1,
+    max_time  => 0,
+    check_request => 1,
+    check_response => 1
 );
 
 my %OPTIONS = (
@@ -26,6 +30,11 @@ my %OPTIONS = (
     no_proxy        => ['P', '', "Do not use proxy. Instead send requests directly to server."],
     server_threads  => ['W', '=i', "Number of worker threads to spawn"],
     client_threads  => ['C', '=i', "Number of client threads to spawn"],
+    max_requests    => ['n', '=i', "Number of requests to send"],
+    max_time        => ['t', '=i', "Maximum time in seconds to run tests"],
+    check_request   => ['chreq', '!', "Compare requests sent by client and received by server"],
+    check_response  => ['chresp', '!', "Compare responses sent by server and received by client"],
+    no_check        => ['nochk', '', "Same as: --no-check-request --no-check-response"],
     exit_running    => ['X', '', "If can't bind HTTP server, try to stop the running one"],
     verbose         => ['v', '+', 'Verbose operation'],
     dump            => ['D', '+', 'Dump state at certain runpoint'],
@@ -144,6 +153,10 @@ sub process_options
     if ($c->{no_proxy}) {
         undef $c->{proxy_address};
     }
+    if ($c->{no_check}) {
+        $c->{check_request} = 0;
+        $c->{check_response} = 0;
+    }
 }
 
 sub url
@@ -153,14 +166,29 @@ sub url
     return "http://". $c->{$key}. "/";
 }
 
+sub run_condition
+{
+    my $c = shift;
+    my $requests = shift;
+    my $watch = shift;
+
+    if ($c->{max_requests} && $requests >= $c->{max_requests}) {
+        return 0;
+    }
+    if ($c->{max_time} && $watch->run_time > $c->{max_time}) {
+        $c->{time_up} = 1;
+        return 0;
+    }
+    return 1;
+}
+
 1;
 
 package Threads;
 use strict;
-use threads ('yield',
-             'stack_size' => 64*4096,
-             'exit' => 'threads_only',
-             'stringify');
+use threads qw[stringify];
+
+use Carp;
 
 my @Threads;
 
@@ -178,6 +206,14 @@ sub join
     for my $thr (@Threads) {
         $thr->join();
     }
+}
+
+sub die
+{
+    # carp @_;
+    # threads->exit() if threads->can('exit');   # Thread friendly
+    # TODO: clean die
+    exit 1;
 }
 
 1;
@@ -217,7 +253,7 @@ sub start
 
 sub get_daemon
 {
-    open my $fh, "+<&=$DaemonFD" or die $!;
+    open my $fh, "+<&=$DaemonFD" or Threads::die "$!";
     my $d = bless $fh => 'HTTP::Daemon';
     %${\*$d} = %Daemon;
     return $d;
@@ -235,19 +271,21 @@ sub worker_thread
     {lock $WorkerThreads;
     ++$WorkerThreads;}
     my $d = get_daemon();
+    my $c = Config::get();
 
     loop:
     while ($RunS) {
         my $conn = $d->accept;
         last loop if $!{EINVAL};
-        die "accept: $!\n" unless $conn;
+        Threads::die "accept: $!\n" unless $conn;
 
         $conn->autoflush(1);
         my $req = $conn->get_request(1) or last;
         my $id = $req->header('X-Request-Id');
+        my $req_frozen = freeze [$req, $id];
         {
             lock @Requests;
-            push @Requests, freeze [$req, $id];
+            push @Requests, $req_frozen;
             cond_signal @Requests;
         }
         my $resp;
@@ -262,7 +300,7 @@ sub worker_thread
         }
         $resp = thaw $resp_frozen;
         $conn->send_response($resp);
-        {
+        if ($c->{check_response}) {
             lock %ResponsesSent;
             $ResponsesSent{$id} = $resp_frozen;
             cond_signal %ResponsesSent;
@@ -271,7 +309,6 @@ sub worker_thread
     }
     {lock $WorkerThreads;
     --$WorkerThreads;}
-    print "Exiting $WorkerThreads\n";
 }
 
 use Time::HiRes 'usleep';
@@ -293,13 +330,15 @@ sub get_request
     my $run = shift;
     my $req;
     my $id;
+    my $frozen;
     {
         lock @Requests;
         cond_wait @Requests
             until @Requests || !$$run;
         return unless $$run;
-        ($req, $id) = @{thaw shift @Requests};
+        $frozen = shift @Requests;
     }
+    ($req, $id) = @{thaw $frozen};
     return ($req, $id);
 }
 
@@ -313,9 +352,10 @@ sub get_response
         cond_wait %ResponsesSent
             until exists $ResponsesSent{$id} || !$$run;
         return unless $$run;
-        $resp = thaw $ResponsesSent{$id};
+        $resp = $ResponsesSent{$id};
         delete $ResponsesSent{$id};
     }
+    $resp = thaw $resp;
     return $resp;
 }
 
@@ -335,9 +375,10 @@ sub set_response
 {
     my $resp = shift;
     my $id = shift;
+    my $frozen = freeze $resp;
     {
         lock %Responses;
-        $Responses{$id} = freeze $resp;
+        $Responses{$id} = $frozen;
         cond_signal %Responses;
     }
     return $resp;
@@ -383,8 +424,9 @@ sub push_req_sent
 {
     my $req = $_[0];
     my $id = $req->header('X-Request-Id');
+    my $frozen = freeze $req;
     lock %ReqSent;
-    $ReqSent{$id} = freeze $req;
+    $ReqSent{$id} = $frozen;
     cond_signal %ReqSent;
 }
 
@@ -398,34 +440,37 @@ sub client_thread
         $ua->proxy('http', $c->url('proxy_address'));
     }
 
-    $ua->add_handler(request_send => \&push_req_sent);
+    if ($c->{check_request}) {
+        $ua->add_handler(request_send => \&push_req_sent);
+    }
 
     loop:
     while ($RunC) {
-        my $req;
+        my $frozen;
         {
             lock @Reqs;
             cond_wait @Reqs
                 until @Reqs || !$RunC;
             last loop unless $RunC;
-            $req = shift @Reqs;
+            $frozen = shift @Reqs;
             if (@Reqs == MAX_REQS - 1) {
                 lock $ReqsFreed;
                 cond_signal $ReqsFreed;
             }
         }
 
-        eval { $req = thaw $req; };
+        my ($req, $id) = @{thaw $frozen};
         my $resp;
         if (ref $req) {
             $resp = $ua->request($req);
         } else {
             $resp = raw_request($req);
         }
-        my $id = $resp->header('X-Request-Id');
+        Threads::die "$!" if $!;
+        $frozen = freeze [ $resp, $id ];
         {
             lock @Resps;
-            push @Resps, freeze [ $resp, $id ];
+            push @Resps, $frozen;
             cond_signal @Resps;
         }
     }
@@ -439,12 +484,16 @@ sub raw_request
     my $req_raw = shift;
     my @chunks = split('~~~', $req_raw);
     my $req = HTTP::Request->parse(join('', @chunks));
-    push_req_sent($req);
+
+    if ($c->{check_request}) {
+        push_req_sent($req);
+    }
+
     my $host = $req->header('Host');
     my $sock = IO::Socket::INET->new(
         PeerAddr => $req->header('Host'),
         Proto => 'tcp'
-    ) or die "connect: $!";
+    ) or Threads::die "connect: $!";
     setsockopt($sock, IPPROTO_TCP, TCP_NODELAY, 1);
     for my $chunk (@chunks) {
         $sock->send($chunk);
@@ -454,7 +503,7 @@ sub raw_request
     my $buf;
     do {
         defined $sock->recv($buf, 4096) # TODO: locks on Keep-Alive
-            or die "recv: $!";
+            or Threads::die "recv: $!";
         $resp_raw .= $buf;
     } while (length($buf));
     my $resp = HTTP::Response->parse($resp_raw);
@@ -475,16 +524,24 @@ sub stop
 sub send_request
 {
     my $req = shift;
-    if (ref $req) {
-        $req = freeze $req;
-    }
+    my $id = shift;
+    my $frozen = freeze [$req, $id];
     {
         lock @Reqs;
         cond_wait $ReqsFreed, @Reqs
             until @Reqs < MAX_REQS;
-        push @Reqs, $req;
+        push @Reqs, $frozen;
         cond_signal @Reqs;
     }
+}
+
+sub clear_queue
+{
+    my @id;
+    lock @Reqs;
+    @id = map { thaw ($_)->[1] } @Reqs;
+    @Reqs = ();
+    return \@id;
 }
 
 sub get_request
@@ -498,9 +555,10 @@ sub get_request
             cond_wait %ReqSent;
         }
         return unless $$run;
-        $req_sent = thaw $ReqSent{$id};
+        $req_sent = $ReqSent{$id};
         delete $ReqSent{$id};
     }
+    $req_sent = thaw $req_sent;
     return $req_sent;
 }
 
@@ -509,14 +567,16 @@ sub get_response
     my $run = shift;
     my $resp;
     my $id;
+    my $frozen;
     {
         lock @Resps;
         until (@Resps || !$$run) {
             cond_wait @Resps;
         }
         return unless $$run;
-        ($resp, $id) = @{thaw shift @Resps};
+        $frozen = shift @Resps;
     }
+    ($resp, $id) = @{thaw $frozen};
     return ($resp, $id);
 }
 
@@ -585,10 +645,20 @@ sub print
     print "Finished in $elpsd secs\n", "$reqs_per_sec requests/sec\n";
 }
 
+sub run_time
+{
+    my $self = shift;
+    return wantarray ?
+        tv_interval($self->start_time, [gettimeofday]) :
+        time - $self->start_time->[0];
+}
+
 1;
 
 package Tests;
 use strict;
+
+use HTTP::Status;
 
 use threads;
 use threads::shared;
@@ -605,25 +675,36 @@ my $Watch = Stopwatch->new();
 sub start
 {
     $RunT = 1;
-    Threads::start(1, \&request_checker_thread);
+    my $c = Config::get();
+    if ($c->{check_request}) {
+        Threads::start(1, \&request_checker_thread);
+    }
     Threads::start(1, \&response_checker_thread);
 }
 
 sub run
 {   
     my $t = shift;
+    my $frozen_test = freeze $t;
+    my $c = Config::get();
 
     $Watch->start;
 
-    for (my $n = 0; $n < 500; ++$n) {
-        {
-            lock %Tests;
-            $Tests{$ReqId} = freeze $t;
-        }
+    for (my $n = 0; $c->run_condition($n, $Watch); ++$n) {
+        {lock %Tests;
+        $Tests{$ReqId} = $frozen_test;}
         Server::set_response($t->response($ReqId), $ReqId);
         # client send queue will block until less than MAX_REQS
-        Client::send_request($t->request($ReqId));
+        Client::send_request($t->request($ReqId), $ReqId);
         $ReqId++;
+    }
+    if ($c->{time_up}) {
+        my $cleared = Client::clear_queue();
+        lock %Tests;
+        for my $id (@$cleared) {
+            delete $Tests{$id};
+        }
+        cond_signal %Tests;
     }
 }
 
@@ -659,12 +740,18 @@ sub response_checker_thread
 {
     {lock $CheckerThreads;
     $CheckerThreads++;}
+
+    my $c = Config::get();
+
     while ($RunT) {
         my ($resp, $id) = Client::get_response(\$RunT)
             or next;
-        my $sent = Server::get_response(\$RunT, $id)
-            or next;
-        check_message($sent, $resp);
+
+        if ($c->{check_response}) {
+            my $sent = Server::get_response(\$RunT, $id)
+                or next;
+            check_message($sent, $resp);
+        }
         {
             lock %Tests;
             delete $Tests{$id};
@@ -699,12 +786,12 @@ sub check_message
     for my $name ($sent->header_field_names) {
         my $val = $got->header($name);
         if (not defined $val) {
-            die "Received ${type} lacks header ${name}!\n";
+            Threads::die "Received ${type} lacks header ${name}!\n";
         }
         my $expected = $sent->header($name);
         $expected =~ s/[\r\n\t ]+/ /gm; # multi-line headers are catenated in HTTP::Daemon
         if ($val ne $expected) {
-            die "Wrong ${type} header ${name}: ${val}, expected ${expected}\n";
+            Threads::die "Wrong ${type} header ${name}: ${val}, expected ${expected}\n";
         }
     }
     my $sent_content = $sent->content;
@@ -712,10 +799,10 @@ sub check_message
     my $sent_len = length $sent_content;
     my $got_len = length $got_content;
     if ($sent_len != $got_len) {
-        die "Wrong ${type} body size: ${got_len}, expectedd ${sent_len}\n";
+        Threads::die "Wrong ${type} body size: ${got_len}, expectedd ${sent_len}\n";
     }
     if ($sent_content ne $got_content) {
-        die "Wrong ${type} body content!\n";
+        Threads::die "Wrong ${type} body content!\n";
     }
 }
 
