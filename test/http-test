@@ -26,7 +26,8 @@ my %CONFIG = (
 
 my %TESTS = (
     simple => 'Simple GET',
-    raw => 'Raw GET, sent by small portions'
+    raw => 'Raw GET, sent by small portions',
+    raw_chunked => 'Raw POST with small chunked body'
 );
 
 my %OPTIONS = (
@@ -73,23 +74,23 @@ my @GETOPT_OPTS = map {
     $specifier
 } keys %OPTIONS;
 
-my $singleton;
+sub new
+{
+    my $class = shift;
+    $class = (ref $class || $class || __PACKAGE__);
+    return bless {} => $class;
+}
+
+my $singleton = Config->new();
+share($singleton);
+%$singleton = %CONFIG;
+$singleton->get_options();
 
 sub get
 {
-    return $singleton
-        if $singleton;
-
-    my $class = shift;
-    $class = (ref $class || $class || __PACKAGE__);
-
-    $singleton = bless {} => $class;
-    share ($singleton);
-    %$singleton = %CONFIG;
-
-    $singleton->get_options();
     return $singleton;
 }
+
 
 sub require_options
 {
@@ -244,6 +245,162 @@ sub die
 
 1;
 
+package ClientConnFixed;
+use HTTP::Daemon;
+use base 'HTTP::Daemon::ClientConn';
+use vars qw($VERSION @ISA $PROTO $DEBUG);
+
+my $CRLF = "\015\012";   # "\r\n" is not portable
+my $HTTP_1_0 = HTTP::Daemon::ClientConn::_http_version("HTTP/1.0");
+my $HTTP_1_1 = HTTP::Daemon::ClientConn::_http_version("HTTP/1.1");
+
+# In case of 'chunked' it will call $hook->chunk() on each chunk
+# and will skip accumulating it in $r. Anything else is left intact
+# from HTTP::Daemon::ClientConn.
+
+sub get_body
+{
+    my $self = shift;
+    my $r = shift;
+    my $hook = shift;
+
+    my $buf = ${*$self}{'httpd_rbuf'};
+    my $timeout = ${*$self}{'io_socket_timeout'};
+    my $fdset = "";
+    vec($fdset, $self->fileno, 1) = 1;
+
+    # Find out how much content to read
+    my $te  = $r->header('Transfer-Encoding');
+    my $ct  = $r->header('Content-Type');
+    my $len = $r->header('Content-Length');
+
+    # Act on the Expect header, if it's there
+    for my $e ( $r->header('Expect') ) {
+        if( lc($e) eq '100-continue' ) {
+            $self->send_status_line(100);
+            $self->send_crlf;
+        }
+        else {
+            $self->send_error(417);
+            $self->reason("Unsupported Expect header value");
+            return;
+        }
+    }
+
+    if ($te && lc($te) eq 'chunked') {
+        # Handle chunked transfer encoding
+    my $length = 0;
+      CHUNK:
+        while (1) {
+            print STDERR "Chunked\n" if $DEBUG;
+            if ($buf =~ s/^([^\012]*)\012//) {
+                my $chunk_head = $1;
+                unless ($chunk_head =~ /^([0-9A-Fa-f]+)/) {
+                    $self->send_error(400);
+                    $self->reason("Bad chunk header $chunk_head");
+                    return;
+                }
+                my $size = hex($1);
+                last CHUNK if $size == 0;
+
+                my $missing = $size - length($buf) + 2; # 2=CRLF at chunk end
+                # must read until we have a complete chunk
+                while ($missing > 0) {
+                    print STDERR "Need $missing more bytes\n" if $DEBUG;
+                    my $n = $self->_need_more($buf, $timeout, $fdset);
+                    return unless $n;
+                    $missing -= $n;
+                }
+                $length += $hook->chunk(substr($buf, 0, $size));
+                substr($buf, 0, $size+2) = '';
+            }
+            else {
+                # need more data in order to have a complete chunk header
+                return unless $self->_need_more($buf, $timeout, $fdset);
+            }
+        }
+
+        $hook->chunks_done($r);
+        # pretend it was a normal entity body
+        $r->remove_header('Transfer-Encoding');
+        $r->header('Content-Length', $length);
+
+        my($key, $val);
+      FOOTER:
+        while (1) {
+            if ($buf !~ /\012/) {
+                # need at least one line to look at
+                return unless $self->_need_more($buf, $timeout, $fdset);
+            }
+            else {
+                $buf =~ s/^([^\012]*)\012//;
+                $_ = $1;
+                s/\015$//;
+                if (/^([\w\-]+)\s*:\s*(.*)/) {
+                    $r->push_header($key, $val) if $key;
+                    ($key, $val) = ($1, $2);
+                }
+                elsif (/^\s+(.*)/) {
+                    $val .= " $1";
+                }
+                elsif (!length) {
+                    last FOOTER;
+                }
+                else {
+                    $self->reason("Bad footer syntax");
+                    return;
+                }
+            }
+        }
+        $r->push_header($key, $val) if $key;
+
+    }
+    elsif ($te) {
+        $self->send_error(501);         # Unknown transfer encoding
+        $self->reason("Unknown transfer encoding '$te'");
+        return;
+
+    }
+    elsif ($len) {
+        # Plain body specified by "Content-Length"
+        my $missing = $len - length($buf);
+        while ($missing > 0) {
+            print "Need $missing more bytes of content\n" if $DEBUG;
+            my $n = $self->_need_more($buf, $timeout, $fdset);
+            return unless $n;
+            $missing -= $n;
+        }
+        if (length($buf) > $len) {
+            $r->content(substr($buf,0,$len));
+            substr($buf, 0, $len) = '';
+        }
+        else {
+            $r->content($buf);
+            $buf='';
+        }
+    }
+    elsif ($ct && $ct =~ m/^multipart\/\w+\s*;.*boundary\s*=\s*("?)(\w+)\1/i) {
+        # Handle multipart content type
+        my $boundary = "$CRLF--$2--";
+        my $index;
+        while (1) {
+            $index = index($buf, $boundary);
+            last if $index >= 0;
+            # end marker not yet found
+            return unless $self->_need_more($buf, $timeout, $fdset);
+        }
+        $index += length($boundary);
+        $r->content(substr($buf, 0, $index));
+        substr($buf, 0, $index) = '';
+
+    }
+    ${*$self}{'httpd_rbuf'} = $buf;
+
+    $r;
+}
+
+1;
+
 package Server;
 use strict;
 use threads;
@@ -292,6 +449,8 @@ my %ResponsesSent :shared;
 my $WorkerThreads :shared;
 $WorkerThreads = 0;
 
+use constant HEADERS_ONLY => 1;
+
 sub worker_thread
 {
     {lock $WorkerThreads;
@@ -301,14 +460,13 @@ sub worker_thread
 
     loop:
     while ($RunS) {
-        my $conn = $d->accept;
+        my $conn = $d->accept('ClientConnFixed');
         last loop if $!{EINVAL};
         Threads::die "accept: $!\n" unless $conn;
 
         $conn->autoflush(1);
-        while (1) {
-            my $req = $conn->get_request(1)
-                or next loop; # FIXME: check errno
+        my $req;
+        while ($req = $conn->get_request(HEADERS_ONLY)) {
             my $id = $req->header('X-Request-Id');
             my $req_frozen = freeze [$req, $id];
             {
@@ -327,6 +485,7 @@ sub worker_thread
                 delete $Responses{$id};
             }
             $test = thaw $test;
+            $conn->get_body($req, $test);
             my ($ok, $resp) = $test->send_response($id, $conn);
             Threads::die "$!" unless $ok;
             $resp = freeze $resp;
@@ -335,11 +494,8 @@ sub worker_thread
                 $ResponsesSent{$id} = $resp;
                 cond_signal %ResponsesSent;
             }
-            if ($${\*$conn}{httpd_nomore}) {
-                shutdown($conn, 2);
-                last;
-            }
-        }
+        } # while ($conn->get_request())
+        # FIXME: check errno
     }
     {lock $WorkerThreads;
     --$WorkerThreads;}
@@ -684,6 +840,8 @@ sub run
     my $test = $c->new_test;
     my $frozen_test = freeze $test;
 
+    print "Test: $c->{test}, started...\n";
+
     $Watch->start;
 
     for (my $n = 0; $c->run_condition($n, $Watch); ++$n) {
@@ -906,10 +1064,11 @@ sub send_request
     my $resp_raw;
     my $buf;
     do {
-        defined $sock->recv($buf, 4096) # TODO: locks on Keep-Alive
+        defined $sock->recv($buf, 4096)
             or Threads::die "recv: $!";
         $resp_raw .= $buf;
     } while (length($buf));
+    # TODO: check errno
     my $resp = HTTP::Response->parse($resp_raw);
     return $resp;
 }
@@ -934,6 +1093,64 @@ Connection: Close\r
 ~~~\r
 EOF
     return $req;
+}
+
+1;
+
+package Test::RawChunked;
+use base 'Test::Raw';
+
+sub new
+{
+    my $class = shift;
+    $class = (ref $class || $class);
+
+    my $self = bless {
+        body => ""
+    } => $class;
+
+    return $self;
+}
+
+sub build_request
+{
+    my $self = shift;
+    my $request_id = shift;
+    my $c = Config::get();
+    my $req =<<EOF;
+POST / HTTP/1.1\r
+User-Agent: Wget/1.17.1 (cygwin)\r
+Accept: */*\r
+Accept-Encoding: identity\r
+Host: $c->{server_address}\r
+X-Request-Id: ${request_id}\r
+Connection: Close\r
+Transfer-Encoding: chunked\r
+\r
+4\r
+abc
+\r
+0\r
+X-Trailer-Header: nothing\r
+X-Trailer-Header2: something\r
+\r
+EOF
+    return $req;
+}
+
+sub chunk
+{
+    my $self = shift;
+    my $chunk = shift;
+    $self->{body} .= $chunk;
+    return length($chunk);
+}
+
+sub chunks_done
+{
+    my $self = shift;
+    my $req = shift;
+    $req->content($self->{body});
 }
 
 1;
