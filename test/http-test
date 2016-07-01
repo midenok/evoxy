@@ -91,7 +91,6 @@ sub get
     return $singleton;
 }
 
-
 sub require_options
 {
     my $c = shift;
@@ -237,7 +236,7 @@ sub join
 
 sub die
 {
-    # carp @_;
+    carp @_;
     # threads->exit() if threads->can('exit');   # Thread friendly
     # TODO: clean die
     exit 1;
@@ -468,13 +467,6 @@ sub worker_thread
         my $req;
         while ($req = $conn->get_request(HEADERS_ONLY)) {
             my $id = $req->header('X-Request-Id');
-            my $req_frozen = freeze [$req, $id];
-            {
-                lock @Requests;
-                push @Requests, $req_frozen;
-                cond_signal @Requests;
-            }
-
             my $test;
             {
                 lock %Responses;
@@ -486,8 +478,17 @@ sub worker_thread
             }
             $test = thaw $test;
             $conn->get_body($req, $test);
+
+            my $req_frozen = freeze [$req, $id];
+            {
+                lock @Requests;
+                push @Requests, $req_frozen;
+                cond_signal @Requests;
+            }
+
             my ($ok, $resp) = $test->send_response($id, $conn);
             Threads::die "$!" unless $ok;
+
             $resp = freeze $resp;
             if ($c->{check_response}) {
                 lock %ResponsesSent;
@@ -879,12 +880,17 @@ sub request_checker_thread
 {
     {lock $CheckerThreads;
     $CheckerThreads++;}
+
+    my $c = Config::get();
+
     while ($RunT) {
         my ($req, $id) = Server::get_request(\$RunT)
             or next;
-        my $sent = Client::get_request(\$RunT, $id)
-            or next;
-        check_message($sent, $req);
+        if ($c->{check_request}) {
+            my $sent = Client::get_request(\$RunT, $id)
+                or next;
+            check_message($sent, $req);
+        }
     }
     {lock $CheckerThreads;
     $CheckerThreads--;}
@@ -930,6 +936,10 @@ sub stop
     }
 }
 
+my %ignored = (
+    'transfer-encoding' => 1
+);
+
 sub check_message
 {
     my $sent = shift;
@@ -938,6 +948,7 @@ sub check_message
     my $type = ref $sent eq 'HTTP::Request' ? 'request' : 'response';
 
     for my $name ($sent->header_field_names) {
+        next if $ignored{lc $name};
         my $val = $got->header($name);
         if (not defined $val) {
             Threads::die "Received ${type} lacks header ${name}!\n";
@@ -953,7 +964,7 @@ sub check_message
     my $sent_len = length $sent_content;
     my $got_len = length $got_content;
     if ($sent_len != $got_len) {
-        Threads::die "Wrong ${type} body size: ${got_len}, expectedd ${sent_len}\n";
+        Threads::die "Wrong ${type} body size: ${got_len}, expected ${sent_len}\n";
     }
     if ($sent_content ne $got_content) {
         Threads::die "Wrong ${type} body content!\n";
@@ -1037,6 +1048,13 @@ use HTTP::Response;
 use Socket qw[:all];
 use Time::HiRes qw[usleep];
 
+sub push_req_sent
+{
+    my $self = shift;
+    my $req = shift;
+    Client::push_req_sent($req);
+}
+
 sub send_request
 {
     my $self = shift;
@@ -1048,7 +1066,7 @@ sub send_request
     my $req = HTTP::Request->parse(join('', @chunks));
 
     if ($c->{check_request}) {
-        push_req_sent($req);
+        $self->push_req_sent($req);
     }
 
     my $host = $req->header('Host');
@@ -1136,6 +1154,17 @@ X-Trailer-Header2: something\r
 \r
 EOF
     return $req;
+}
+
+sub push_req_sent
+{
+    my $self = shift;
+    my $req = shift;
+    # HTTP::Request can't parse chunked body
+    $req->content("abc\n");
+    $req->header('X-Trailer-Header', 'nothing');
+    $req->header('X-Trailer-Header2', 'something');
+    Client::push_req_sent($req);
 }
 
 sub chunk
