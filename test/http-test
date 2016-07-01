@@ -10,6 +10,7 @@ use Data::Dumper;
 
 # defaults and non-CLI settings
 my %CONFIG = (
+    test => 'simple',
     listen_ip => '127.0.0.1',
     listen_port => '8080',
     proxy_address => 'localhost:9000',
@@ -25,12 +26,14 @@ my %CONFIG = (
 
 my %TESTS = (
     simple => 'Simple GET',
-    raw => 'Raw GET sent by small portions'
+    raw => 'Raw GET, sent by small portions'
 );
 
 my %OPTIONS = (
     # Format:
     # name          => ['aliases', 'type', 'description', 'dashed_variant'(generated)]
+    test            => ['t', '=s', 'Test type to run'],
+    list            => ['l', '', 'List test types'],
     server_address  => ['s', '=s', 'Bind HTTP server to specified IP:PORT'],
     proxy_address   => ['p', '=s', 'IP:PORT of tested HTTP proxy'],
     no_proxy        => ['P', '', "Do not use proxy, instead send requests directly to server."],
@@ -38,7 +41,7 @@ my %OPTIONS = (
     server_threads  => ['W', '=i', "Number of worker threads to spawn"],
     client_threads  => ['C', '=i', "Number of client threads to spawn"],
     max_requests    => ['n', '=i', "Number of requests to send"],
-    max_time        => ['t', '=i', "Maximum time in seconds to run tests"],
+    max_time        => ['T', '=i', "Maximum time in seconds to run tests"],
     check_request   => ['chreq', '!', "Compare requests sent by client and received by server"],
     check_response  => ['chresp', '!', "Compare responses sent by server and received by client"],
     no_check        => ['nochk', '', "Same as: --no-check-request --no-check-response"],
@@ -150,6 +153,12 @@ sub get_options
 sub process_options
 {
     my $c = shift;
+    if ($c->{list}) {
+        for (sort keys %TESTS) {
+            print $_, " ($TESTS{$_})\n";
+        }
+        exit 0;
+    }
     if ($c->{server_address}) {
         my @l = split(':', $c->{server_address});
         $c->{listen_ip} = $l[0] if $l[0];
@@ -168,6 +177,19 @@ sub process_options
         $c->{check_request} = 0;
         $c->{check_response} = 0;
     }
+
+    if (not exists $TESTS{$c->{test}}) {
+        die "No such test: $c->{test}\n";
+    }
+
+    my $class = "Test::". join '', map { ucfirst } split('_', $c->{test});
+    $c->{test_class} = $class;
+}
+
+sub new_test
+{
+    my $c = shift;
+    return $c->{test_class}->new();
 }
 
 sub run_condition
@@ -294,7 +316,7 @@ sub worker_thread
                 push @Requests, $req_frozen;
                 cond_signal @Requests;
             }
-    
+
             my $test;
             {
                 lock %Responses;
@@ -472,7 +494,7 @@ sub client_thread
 
         my ($test, $id) = @{thaw $frozen};
         my $resp = $test->send_request($id, $ua);
- 
+
         Threads::die "$!" if $!;
         $frozen = freeze [ $resp, $id ];
         {
@@ -658,9 +680,9 @@ sub start
 
 sub run
 {   
-    my $test = shift;
-    my $frozen_test = freeze $test;
     my $c = Config::get();
+    my $test = $c->new_test;
+    my $frozen_test = freeze $test;
 
     $Watch->start;
 
@@ -922,8 +944,7 @@ Server::start();
 Client::start();
 Tests::start();
 
-my $t = Test::Simple->new();
-Tests::run($t);
+Tests::run();
 Tests::wait();
 
 Tests::stop();
