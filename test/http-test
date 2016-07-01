@@ -22,6 +22,11 @@ my %CONFIG = (
     check_response => 1
 );
 
+my %TESTS = (
+    simple => 'Simple GET',
+    raw => 'Raw GET sent by small portions'
+);
+
 my %OPTIONS = (
     # Format:
     # name          => ['aliases', 'type', 'description', 'dashed_variant'(generated)]
@@ -150,20 +155,17 @@ sub process_options
     } else {
         $c->{server_address} = $c->{listen_ip}. ':'. $c->{listen_port};
     }
+    $c->{server_url} = "http://". $c->{server_address}. "/";
+
     if ($c->{no_proxy}) {
         undef $c->{proxy_address};
+    } else {
+        $c->{proxy_url} = "http://". $c->{proxy_address}. "/";
     }
     if ($c->{no_check}) {
         $c->{check_request} = 0;
         $c->{check_response} = 0;
     }
-}
-
-sub url
-{
-    my $c = shift;
-    my $key = shift;
-    return "http://". $c->{$key}. "/";
 }
 
 sub run_condition
@@ -288,21 +290,23 @@ sub worker_thread
             push @Requests, $req_frozen;
             cond_signal @Requests;
         }
-        my $resp;
-        my $resp_frozen;
+
+        my $test;
         {
             lock %Responses;
             cond_wait %Responses
                 until exists $Responses{$id} || !$RunS;
             last loop unless $RunS;
-            $resp_frozen = $Responses{$id};
+            $test = $Responses{$id};
             delete $Responses{$id};
         }
-        $resp = thaw $resp_frozen;
-        $conn->send_response($resp);
+        $test = thaw $test;
+        my ($ok, $resp) = $test->send_response($id, $conn);
+        Threads::die "$!" unless $ok;
+        $resp = freeze $resp;
         if ($c->{check_response}) {
             lock %ResponsesSent;
-            $ResponsesSent{$id} = $resp_frozen;
+            $ResponsesSent{$id} = $resp;
             cond_signal %ResponsesSent;
         }
         shutdown($conn, 2); # FIXME: keepalives
@@ -373,15 +377,15 @@ sub broadcast
 
 sub set_response
 {
-    my $resp = shift;
+    my $test = shift;
     my $id = shift;
-    my $frozen = freeze $resp;
+    $test = freeze $test if ref $test;
     {
         lock %Responses;
-        $Responses{$id} = $frozen;
+        $Responses{$id} = $test;
         cond_signal %Responses;
     }
-    return $resp;
+    return $test;
 }
 
 =pod
@@ -395,7 +399,6 @@ sub set_response
 package Client;
 use strict;
 use LWP  5.825;
-use Socket qw(:all);
 use Time::HiRes 'usleep';
 
 use threads;
@@ -405,8 +408,8 @@ use Storable qw[freeze thaw];
 my $RunC :shared;
 
 use constant MAX_REQS => 1000;
-my @Reqs :shared;
-my $ReqsFreed :shared;
+my @CQueue :shared;
+my $CQFreed :shared;
 my %ReqSent :shared;
 
 my @Resps :shared;
@@ -437,7 +440,7 @@ sub client_thread
     my $c = Config::get();
     my $ua = LWP::UserAgent->new;
     if ($c->{proxy_address}) {
-        $ua->proxy('http', $c->url('proxy_address'));
+        $ua->proxy('http', $c->{'proxy_url'});
     }
 
     if ($c->{check_request}) {
@@ -448,24 +451,20 @@ sub client_thread
     while ($RunC) {
         my $frozen;
         {
-            lock @Reqs;
-            cond_wait @Reqs
-                until @Reqs || !$RunC;
+            lock @CQueue;
+            cond_wait @CQueue
+                until @CQueue || !$RunC;
             last loop unless $RunC;
-            $frozen = shift @Reqs;
-            if (@Reqs == MAX_REQS - 1) {
-                lock $ReqsFreed;
-                cond_signal $ReqsFreed;
+            $frozen = shift @CQueue;
+            if (@CQueue == MAX_REQS - 1) {
+                lock $CQFreed;
+                cond_signal $CQFreed;
             }
         }
 
-        my ($req, $id) = @{thaw $frozen};
-        my $resp;
-        if (ref $req) {
-            $resp = $ua->request($req);
-        } else {
-            $resp = raw_request($req);
-        }
+        my ($test, $id) = @{thaw $frozen};
+        my $resp = $test->send_request($id, $ua);
+ 
         Threads::die "$!" if $!;
         $frozen = freeze [ $resp, $id ];
         {
@@ -478,69 +477,36 @@ sub client_thread
     --$ClientThreads;}
 }
 
-sub raw_request
-{
-    my $c = Config::get();
-    my $req_raw = shift;
-    my @chunks = split('~~~', $req_raw);
-    my $req = HTTP::Request->parse(join('', @chunks));
-
-    if ($c->{check_request}) {
-        push_req_sent($req);
-    }
-
-    my $host = $req->header('Host');
-    my $sock = IO::Socket::INET->new(
-        PeerAddr => $req->header('Host'),
-        Proto => 'tcp'
-    ) or Threads::die "connect: $!";
-    setsockopt($sock, IPPROTO_TCP, TCP_NODELAY, 1);
-    for my $chunk (@chunks) {
-        $sock->send($chunk);
-        usleep $c->{raw_chunks_delay};
-    }
-    my $resp_raw;
-    my $buf;
-    do {
-        defined $sock->recv($buf, 4096) # TODO: locks on Keep-Alive
-            or Threads::die "recv: $!";
-        $resp_raw .= $buf;
-    } while (length($buf));
-    my $resp = HTTP::Response->parse($resp_raw);
-    return $resp;
-}
-
 sub stop
 {
     $RunC = 0;
     while ($ClientThreads) {
-        lock @Reqs;
-        cond_signal @Reqs;
+        lock @CQueue;
+        cond_signal @CQueue;
     } continue {
         usleep 1;
     }
 }
 
-sub send_request
+sub enqueue_request
 {
-    my $req = shift;
-    my $id = shift;
-    my $frozen = freeze [$req, $id];
+    my $frozen = freeze [$_[0], $_[1]];
     {
-        lock @Reqs;
-        cond_wait $ReqsFreed, @Reqs
-            until @Reqs < MAX_REQS;
-        push @Reqs, $frozen;
-        cond_signal @Reqs;
+        lock @CQueue;
+        cond_wait $CQFreed, @CQueue
+            until @CQueue < MAX_REQS;
+        push @CQueue, $frozen;
+        cond_signal @CQueue;
     }
+    return $frozen;
 }
 
 sub clear_queue
 {
     my @id;
-    lock @Reqs;
-    @id = map { thaw ($_)->[1] } @Reqs;
-    @Reqs = ();
+    lock @CQueue;
+    @id = map { thaw ($_)->[1] } @CQueue;
+    @CQueue = ();
     return \@id;
 }
 
@@ -684,8 +650,8 @@ sub start
 
 sub run
 {   
-    my $t = shift;
-    my $frozen_test = freeze $t;
+    my $test = shift;
+    my $frozen_test = freeze $test;
     my $c = Config::get();
 
     $Watch->start;
@@ -693,9 +659,9 @@ sub run
     for (my $n = 0; $c->run_condition($n, $Watch); ++$n) {
         {lock %Tests;
         $Tests{$ReqId} = $frozen_test;}
-        Server::set_response($t->response($ReqId), $ReqId);
+        Server::set_response($frozen_test, $ReqId);
         # client send queue will block until less than MAX_REQS
-        Client::send_request($t->request($ReqId), $ReqId);
+        Client::enqueue_request($test, $ReqId);
         $ReqId++;
     }
     if ($c->{time_up}) {
@@ -808,7 +774,10 @@ sub check_message
 
 1;
 
-package Test;
+package Test::Simple;
+use strict;
+
+use HTTP::Request::Common;
 use HTTP::Response;
 use HTTP::Status;
 
@@ -817,14 +786,40 @@ sub new
     my $class = shift;
     $class = (ref $class || $class);
 
-    my $self = bless {
-        conf => Config::get()
-    } => $class;
+    my $self = bless {} => $class;
 
     return $self;
 }
 
-sub response
+sub send_request
+{
+    my $self = shift;
+    my $id = shift;
+    my $ua = shift;
+    my $req = $self->build_request($id);
+    return $ua->request($req);
+}
+
+sub send_response
+{
+    my $self = shift;
+    my $id = shift;
+    my $conn = shift;
+    my $resp = $self->build_response($id);
+    return ($conn->send_response($resp), $resp);
+}
+
+sub build_request
+{
+    my $self = shift;
+    my $id = shift;
+    my $c = Config::get();
+    my $req = GET($c->{server_url});
+    $req->header('X-Request-Id' => $id);
+    return $req;
+}
+
+sub build_response
 {
     my $self = shift;
     my $request_id = shift;
@@ -845,33 +840,55 @@ sub response
 
 1;
 
-package Test::Simple;
-use parent 'Test';
+package Test::Raw;
+use parent 'Test::Simple';
 use strict;
 
-use HTTP::Request::Common;
+use HTTP::Request;
+use HTTP::Response;
+use Socket qw[:all];
+use Time::HiRes qw[usleep];
 
-sub request
+sub send_request
 {
     my $self = shift;
     my $id = shift;
-    my $c = $self->{conf};
-    my $req = GET($c->url('server_address'));
-    $req->header('X-Request-Id' => $id);
-    return $req;
+
+    my $c = Config::get();
+    my $req_raw = $self->build_request($id);
+    my @chunks = split('~~~', $req_raw);
+    my $req = HTTP::Request->parse(join('', @chunks));
+
+    if ($c->{check_request}) {
+        push_req_sent($req);
+    }
+
+    my $host = $req->header('Host');
+    my $sock = IO::Socket::INET->new(
+        PeerAddr => $req->header('Host'),
+        Proto => 'tcp'
+    ) or Threads::die "connect: $!";
+    setsockopt($sock, IPPROTO_TCP, TCP_NODELAY, 1);
+    for my $chunk (@chunks) {
+        $sock->send($chunk);
+        usleep $c->{raw_chunks_delay};
+    }
+    my $resp_raw;
+    my $buf;
+    do {
+        defined $sock->recv($buf, 4096) # TODO: locks on Keep-Alive
+            or Threads::die "recv: $!";
+        $resp_raw .= $buf;
+    } while (length($buf));
+    my $resp = HTTP::Response->parse($resp_raw);
+    return $resp;
 }
 
-1;
-
-package Test::Raw;
-use parent 'Test';
-use strict;
-
-sub request
+sub build_request
 {
     my $self = shift;
     my $request_id = shift;
-    my $c = $self->{conf};
+    my $c = Config::get();
     my $req =<<EOF;
 GET / HTTP/1.1\r
 User-Agent: Wget/1.17.1 (cygwin)\r
