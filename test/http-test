@@ -13,6 +13,7 @@ my %CONFIG = (
     listen_ip => '127.0.0.1',
     listen_port => '8080',
     proxy_address => 'localhost:9000',
+    keep_alive => 1,
     server_threads => 1,
     client_threads => 1,
     raw_chunks_delay => 100, # usecs
@@ -32,7 +33,8 @@ my %OPTIONS = (
     # name          => ['aliases', 'type', 'description', 'dashed_variant'(generated)]
     server_address  => ['s', '=s', 'Bind HTTP server to specified IP:PORT'],
     proxy_address   => ['p', '=s', 'IP:PORT of tested HTTP proxy'],
-    no_proxy        => ['P', '', "Do not use proxy. Instead send requests directly to server."],
+    no_proxy        => ['P', '', "Do not use proxy, instead send requests directly to server."],
+    keep_alive      => ['k', '!', "Use persistent connections"],
     server_threads  => ['W', '=i', "Number of worker threads to spawn"],
     client_threads  => ['C', '=i', "Number of client threads to spawn"],
     max_requests    => ['n', '=i', "Number of requests to send"],
@@ -282,34 +284,40 @@ sub worker_thread
         Threads::die "accept: $!\n" unless $conn;
 
         $conn->autoflush(1);
-        my $req = $conn->get_request(1) or last;
-        my $id = $req->header('X-Request-Id');
-        my $req_frozen = freeze [$req, $id];
-        {
-            lock @Requests;
-            push @Requests, $req_frozen;
-            cond_signal @Requests;
+        while (1) {
+            my $req = $conn->get_request(1)
+                or next loop; # FIXME: check errno
+            my $id = $req->header('X-Request-Id');
+            my $req_frozen = freeze [$req, $id];
+            {
+                lock @Requests;
+                push @Requests, $req_frozen;
+                cond_signal @Requests;
+            }
+    
+            my $test;
+            {
+                lock %Responses;
+                cond_wait %Responses
+                    until exists $Responses{$id} || !$RunS;
+                last loop unless $RunS;
+                $test = $Responses{$id};
+                delete $Responses{$id};
+            }
+            $test = thaw $test;
+            my ($ok, $resp) = $test->send_response($id, $conn);
+            Threads::die "$!" unless $ok;
+            $resp = freeze $resp;
+            if ($c->{check_response}) {
+                lock %ResponsesSent;
+                $ResponsesSent{$id} = $resp;
+                cond_signal %ResponsesSent;
+            }
+            if ($${\*$conn}{httpd_nomore}) {
+                shutdown($conn, 2);
+                last;
+            }
         }
-
-        my $test;
-        {
-            lock %Responses;
-            cond_wait %Responses
-                until exists $Responses{$id} || !$RunS;
-            last loop unless $RunS;
-            $test = $Responses{$id};
-            delete $Responses{$id};
-        }
-        $test = thaw $test;
-        my ($ok, $resp) = $test->send_response($id, $conn);
-        Threads::die "$!" unless $ok;
-        $resp = freeze $resp;
-        if ($c->{check_response}) {
-            lock %ResponsesSent;
-            $ResponsesSent{$id} = $resp;
-            cond_signal %ResponsesSent;
-        }
-        shutdown($conn, 2); # FIXME: keepalives
     }
     {lock $WorkerThreads;
     --$WorkerThreads;}
@@ -438,7 +446,7 @@ sub client_thread
     {lock $ClientThreads;
     ++$ClientThreads;}
     my $c = Config::get();
-    my $ua = LWP::UserAgent->new;
+    my $ua = LWP::UserAgent->new(keep_alive => $c->{keep_alive});
     if ($c->{proxy_address}) {
         $ua->proxy('http', $c->{'proxy_url'});
     }
