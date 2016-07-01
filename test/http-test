@@ -27,7 +27,9 @@ my %CONFIG = (
 my %TESTS = (
     simple => 'Simple GET',
     raw => 'Raw GET, sent by small portions',
-    raw_chunked => 'Raw POST with small chunked body'
+    raw_chunked => 'Raw POST with small chunked body',
+    post_file => 'Send small file in POST body',
+    post_chunked => 'Send large file in chunked POST body'
 );
 
 my %OPTIONS = (
@@ -46,6 +48,7 @@ my %OPTIONS = (
     check_request   => ['chreq', '!', "Compare requests sent by client and received by server"],
     check_response  => ['chresp', '!', "Compare responses sent by server and received by client"],
     no_check        => ['nochk', '', "Same as: --no-check-request --no-check-response"],
+    file            => ['f', '=s', "Existing file that will be read by some tests"],
     exit_running    => ['X', '', "If can't bind HTTP server, try to stop the running one"],
     verbose         => ['v', '+', 'Verbose operation'],
     dump            => ['D', '+', 'Dump state at certain runpoint'],
@@ -184,6 +187,9 @@ sub process_options
 
     my $class = "Test::". join '', map { ucfirst } split('_', $c->{test});
     $c->{test_class} = $class;
+    if ($class->can('process_options')) {
+        $class->process_options($c);
+    }
 }
 
 sub new_test
@@ -442,7 +448,6 @@ sub get_daemon
 }
 
 my @Requests :shared;
-my %Responses :shared;
 my %ResponsesSent :shared;
 
 my $WorkerThreads :shared;
@@ -456,6 +461,7 @@ sub worker_thread
     ++$WorkerThreads;}
     my $d = get_daemon();
     my $c = Config::get();
+    my $test = $c->new_test;
 
     loop:
     while ($RunS) {
@@ -467,17 +473,8 @@ sub worker_thread
         my $req;
         while ($req = $conn->get_request(HEADERS_ONLY)) {
             my $id = $req->header('X-Request-Id');
-            my $test;
-            {
-                lock %Responses;
-                cond_wait %Responses
-                    until exists $Responses{$id} || !$RunS;
-                last loop unless $RunS;
-                $test = $Responses{$id};
-                delete $Responses{$id};
-            }
-            $test = thaw $test;
-            $conn->get_body($req, $test);
+            $conn->get_body($req, $test)
+                or Threads::die "Server failed to parse body!\n";
 
             my $req_frozen = freeze [$req, $id];
             {
@@ -509,9 +506,6 @@ sub stop
     $RunS = 0;
     shutdown(get_daemon(), 2);
     while ($WorkerThreads) {
-        lock %Responses;
-        cond_broadcast %Responses;
-    } continue {
         usleep 1;
     }
 }
@@ -562,19 +556,6 @@ sub broadcast
     }
 }
 
-sub set_response
-{
-    my $test = shift;
-    my $id = shift;
-    $test = freeze $test if ref $test;
-    {
-        lock %Responses;
-        $Responses{$id} = $test;
-        cond_signal %Responses;
-    }
-    return $test;
-}
-
 =pod
 @SIG{$_} = sub {
     $RUN = 0;
@@ -615,9 +596,12 @@ sub push_req_sent
     my $req = $_[0];
     my $id = $req->header('X-Request-Id');
     my $frozen = freeze $req;
-    lock %ReqSent;
-    $ReqSent{$id} = $frozen;
-    cond_signal %ReqSent;
+    {
+        lock %ReqSent;
+        $ReqSent{$id} = $frozen;
+        cond_signal %ReqSent;
+    }
+    return undef;
 }
 
 sub client_thread
@@ -625,35 +609,29 @@ sub client_thread
     {lock $ClientThreads;
     ++$ClientThreads;}
     my $c = Config::get();
-    my $ua = LWP::UserAgent->new(keep_alive => $c->{keep_alive});
-    if ($c->{proxy_address}) {
-        $ua->proxy('http', $c->{'proxy_url'});
-    }
-
-    if ($c->{check_request}) {
-        $ua->add_handler(request_send => \&push_req_sent);
-    }
+    my $test = $c->new_test->make_ua;
 
     loop:
     while ($RunC) {
-        my $frozen;
+        my $id;
         {
             lock @CQueue;
             cond_wait @CQueue
                 until @CQueue || !$RunC;
             last loop unless $RunC;
-            $frozen = shift @CQueue;
+            $id = shift @CQueue;
             if (@CQueue == MAX_REQS - 1) {
                 lock $CQFreed;
                 cond_signal $CQFreed;
             }
         }
 
-        my ($test, $id) = @{thaw $frozen};
-        my $resp = $test->send_request($id, $ua);
+        my $resp = $test->send_request($id);
+
+        $resp->request(undef); # TODO: actually we don't need %ReqSent since we can pass req in resp
 
         Threads::die "$!" if $!;
-        $frozen = freeze [ $resp, $id ];
+        my $frozen = freeze [ $resp, $id ];
         {
             lock @Resps;
             push @Resps, $frozen;
@@ -675,24 +653,21 @@ sub stop
     }
 }
 
-sub enqueue_request
+sub enqueue
 {
-    my $frozen = freeze [$_[0], $_[1]];
-    {
-        lock @CQueue;
-        cond_wait $CQFreed, @CQueue
-            until @CQueue < MAX_REQS;
-        push @CQueue, $frozen;
-        cond_signal @CQueue;
-    }
-    return $frozen;
+    my $id = shift;
+    lock @CQueue;
+    cond_wait $CQFreed, @CQueue
+        until @CQueue < MAX_REQS;
+    push @CQueue, $id;
+    cond_signal @CQueue;
 }
 
 sub clear_queue
 {
     my @id;
     lock @CQueue;
-    @id = map { thaw ($_)->[1] } @CQueue;
+    @id = @CQueue;
     @CQueue = ();
     return \@id;
 }
@@ -838,19 +813,19 @@ sub start
 sub run
 {   
     my $c = Config::get();
-    my $test = $c->new_test;
-    my $frozen_test = freeze $test;
 
     print "Test: $c->{test}, started...\n";
 
     $Watch->start;
 
     for (my $n = 0; $c->run_condition($n, $Watch); ++$n) {
-        {lock %Tests;
-        $Tests{$ReqId} = $frozen_test;}
-        Server::set_response($frozen_test, $ReqId);
-        # client send queue will block until less than MAX_REQS
-        Client::enqueue_request($test, $ReqId);
+        {
+            lock %Tests;
+            $Tests{$ReqId} = $c->{check_request} ? 2 : 1;
+        }
+
+        # client queue will block until less than MAX_REQS
+        Client::enqueue($ReqId);
         $ReqId++;
     }
     if ($c->{time_up}) {
@@ -882,14 +857,25 @@ sub request_checker_thread
     $CheckerThreads++;}
 
     my $c = Config::get();
+    my $t = $c->new_test;
+    my $can_check = $t->can('check_request');
 
     while ($RunT) {
         my ($req, $id) = Server::get_request(\$RunT)
             or next;
-        if ($c->{check_request}) {
-            my $sent = Client::get_request(\$RunT, $id)
-                or next;
+        my $sent = Client::get_request(\$RunT, $id)
+            or next;
+        if ($can_check) {
+            $t->check_request($sent, $req);
+        } else {
             check_message($sent, $req);
+        }
+        {
+            lock %Tests;
+            if (0 == --$Tests{$id}) {
+                delete $Tests{$id};
+                cond_signal %Tests;
+            }
         }
     }
     {lock $CheckerThreads;
@@ -902,6 +888,8 @@ sub response_checker_thread
     $CheckerThreads++;}
 
     my $c = Config::get();
+    my $t = $c->new_test;
+    my $can_check = $t->can('check_response');
 
     while ($RunT) {
         my ($resp, $id) = Client::get_response(\$RunT)
@@ -910,12 +898,18 @@ sub response_checker_thread
         if ($c->{check_response}) {
             my $sent = Server::get_response(\$RunT, $id)
                 or next;
-            check_message($sent, $resp);
+            if ($can_check) {
+                $t->check_response($sent, $resp);
+            } else {
+                check_message($sent, $resp);
+            }
         }
         {
             lock %Tests;
-            delete $Tests{$id};
-            cond_signal %Tests;
+            if (0 == --$Tests{$id}) {
+                delete $Tests{$id};
+                cond_signal %Tests;
+            }
         }
         ++$ReqDone;
     }
@@ -983,6 +977,7 @@ use HTTP::Status;
 sub new
 {
     my $class = shift;
+    my $option = shift;
     $class = (ref $class || $class);
 
     my $self = bless {} => $class;
@@ -990,11 +985,28 @@ sub new
     return $self;
 }
 
+sub make_ua
+{
+    my $self = shift;
+    my $c = Config::get();
+
+    my $ua = LWP::UserAgent->new(keep_alive => $c->{keep_alive});
+    if ($c->{proxy_address}) {
+        $ua->proxy('http', $c->{'proxy_url'});
+    }
+
+    if ($c->{check_request}) {
+        $ua->add_handler(request_send => \&Client::push_req_sent);
+    }
+    $self->{ua} = $ua;
+    return $self;
+}
+
 sub send_request
 {
     my $self = shift;
     my $id = shift;
-    my $ua = shift;
+    my $ua = $self->{ua};
     my $req = $self->build_request($id);
     return $ua->request($req);
 }
@@ -1013,8 +1025,7 @@ sub build_request
     my $self = shift;
     my $id = shift;
     my $c = Config::get();
-    my $req = GET($c->{server_url});
-    $req->header('X-Request-Id' => $id);
+    my $req = GET($c->{server_url}, X_Request_Id => $id);
     return $req;
 }
 
@@ -1180,6 +1191,94 @@ sub chunks_done
     my $self = shift;
     my $req = shift;
     $req->content($self->{body});
+}
+
+1;
+
+package Test::PostFile;
+use base 'Test::Simple';
+
+use HTTP::Request::Common;
+
+sub process_options
+{
+    my $class = shift;
+    my $c = shift;
+    die "post_file requires valid --file option!\n"
+        unless $c->{file} && -f $c->{file};
+}
+
+sub build_request
+{
+    my $self = shift;
+    my $id = shift;
+    my $c = Config::get();
+    my $req = POST(
+        $c->{server_url},
+        Content_Type => 'multipart/form-data',
+        Content      => [ file => [ $c->{file} ] ],
+        X_Request_Id => $id
+    );
+    return $req;
+}
+
+sub chunk
+{
+    my $self = shift;
+    my $chunk = shift;
+    return length($chunk);
+}
+
+sub chunks_done
+{
+    my $self = shift;
+    my $req = shift;
+}
+
+1;
+
+package Test::PostChunked;
+use base 'Test::PostFile';
+
+use Net::HTTP;
+
+sub make_ua
+{
+    my $self = shift;
+    return $self;
+}
+
+sub send_request
+{
+    my $self = shift;
+    my $id = shift;
+    my $c = Config::get;
+    my $ua = $self->{ua} || ($self->{ua} =
+        Net::HTTP->new(
+            Host => $c->{server_address},
+            KeepAlive => $c->{keep_alive}));
+    $ua->write_request(POST => '/',
+        'User-Agent' => "Mozilla/5.0",
+        'Content-Type' => 'application/octet-stream',
+        'Transfer-Encoding' => 'chunked',
+        'X-Request-Id' => $id
+    ) or Threads::die "write_request() failed!";
+    open my $fh, "<", $c->{file}
+        or Threads::die "$!";
+    my ($len, $data);
+    while ($len = sysread $fh, $data, 4096) {
+        $ua->write_chunk($data) or
+            Threads::die "write_chunk() failed!"
+    }
+    $ua->write_chunk_eof() or
+        Threads::die "write_chunk_eof() failed!";
+    my ($code, $mess, @headers) = $ua->read_response_headers();
+    my $body;
+    while ($ua->read_entity_body($data, $len)) {
+        $body .= $data;
+    }
+    my $resp = HTTP::Response->new($code, $mess, \@headers, $body);
+    return $resp;
 }
 
 1;
