@@ -32,6 +32,7 @@ private:
 
     virtual void read_callback() = 0;
     virtual void write_callback() = 0;
+    virtual void error_callback(int err) = 0;
 
     void terminate()
     {
@@ -42,6 +43,8 @@ private:
             conn_watcher.fd = 0;
         }
     }
+
+    typedef void(*callback_f)(EV_P_ ev_io *w, int revents);
 
     static void
     conn_callback (EV_P_ ev_io *w, int revents)
@@ -102,6 +105,31 @@ protected:
         ev_io_stop(event_loop, &conn_watcher);
         conn_watcher.events = 0;
     }
+
+    void check_socket()
+    {
+        socklen_t optlen = sizeof(int);
+        int sockerr;
+        int err = getsockopt(conn_watcher.fd, SOL_SOCKET, SO_ERROR, &sockerr, &optlen);
+        if (err < 0)
+            throw Errno("getsockopt");
+
+        if (sockerr) {
+            error_callback(sockerr);
+        } else {
+            ev_io_stop(event_loop, &conn_watcher);
+            ev_io_init(&conn_watcher, conn_callback, conn_watcher.fd, EV_WRITE);
+            ev_io_start(event_loop, &conn_watcher);
+        }
+    }
+
+    static void
+        connect_callback(EV_P_ ev_io *w, int revents)
+    {
+         OnEventLoop *self = (OnEventLoop *)w->data;
+         self->check_socket();
+    }
+
 public:
     OnEventLoop(struct ev_loop *event_loop_) :
         event_loop { event_loop_ }
@@ -111,12 +139,13 @@ public:
         async_watcher.data = this;
     }
 
+    template <callback_f CALLBACK = conn_callback>
     void start_conn_watcher(int events = EV_READ)
     {
         if (fcntl(conn_watcher.fd, F_SETFL, fcntl(conn_watcher.fd, F_GETFL, 0) | O_NONBLOCK) == -1) {
             throw Errno("fcntl");
         }
-        ev_io_init(&conn_watcher, conn_callback, conn_watcher.fd, events);
+        ev_io_init(&conn_watcher, CALLBACK, conn_watcher.fd, events);
         conn_watcher.data = this;
         ev_io_start(event_loop, &conn_watcher);
     }
@@ -253,6 +282,7 @@ public:
 
     void read_callback() override;
     void write_callback() override;
+    void error_callback(int err) override;
 };
 
 
@@ -287,6 +317,8 @@ public:
 
     void read_callback() override;
     void write_callback() override;
+    void error_callback(int) override
+    {}
 };
 
 

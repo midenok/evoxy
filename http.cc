@@ -160,11 +160,11 @@ HTTPParser::parse_header_line()
 
         cl = host.find(':');
         if (cl != buffer::string::npos) {
-            host.assign(host.begin(), &host[cl]);
-            if (++cl < host.size()) {
-                buffer::string port_(&host[cl], host.end());
+            if (cl + 1 < host.size()) {
+                buffer::string port_(&host[cl + 1], host.end());
                 port = buffer::stol(port_);
             }
+            host.assign(host.begin(), &host[cl]);
         }
         // fix host terminator to make getaddrinfo happy
         assert(host.end() < found_line.end());
@@ -215,14 +215,16 @@ HTTPParser::Status HTTPParser::parse_head(buffer::string &recv_chunk)
 
     while (next_line()) {
         Status res = (this->*parse_line)();
-        if (res != CONTINUE)
+        if (res != CONTINUE) {
+            recv_chunk = input_buf;
             return res;
+        }
     }
     return CONTINUE;
 }
 
 
-HTTPParser::Status HTTPParser::parse_body(buffer::string& recv_chunk)
+HTTPParser::Status HTTPParser::parse_body(buffer::string &recv_chunk)
 {
     assert(!recv_chunk.empty());
     while (!recv_chunk.empty()) {

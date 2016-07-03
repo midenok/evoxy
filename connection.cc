@@ -45,6 +45,7 @@ input buffer have: recv_begin, recv_max, read_begin, read_
 void ProxyFrontend::read_callback()
 {
     buffer::string recv_chunk;
+    // 'buffer' semantics is across multiple calls, recv_chunk points to last portion received
     IOBuffer::Status err = buffer.recv(conn_watcher.fd, recv_chunk);
 
     switch (err) {
@@ -86,8 +87,8 @@ void ProxyFrontend::read_callback()
                 return;
             }
 
-            if (!buffer.empty())
-                recv_chunk = buffer;
+            if (recv_chunk.empty())
+                return;
 
             break;
         case HTTPParser::TERMINATE:
@@ -200,8 +201,14 @@ bool ProxyBackend::connect(const char* host, uint32_t port)
         return true;
     }
 
-    start_conn_watcher(EV_WRITE);
+    start_conn_watcher<connect_callback>();
     return false;
+}
+
+void ProxyBackend::error_callback(int err)
+{
+    debug("connect: ", strerror(err));
+    frontend.release();
 }
 
 void ProxyBackend::write_callback()

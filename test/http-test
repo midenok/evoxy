@@ -50,6 +50,7 @@ my %OPTIONS = (
     no_check        => ['nochk', '', "Same as: --no-check-request --no-check-response"],
     file            => ['f', '=s', "Existing file that will be read by some tests"],
     exit_running    => ['X', '', "If can't bind HTTP server, try to stop the running one"],
+    quiet           => ['q', '', 'Quiet operation'],
     verbose         => ['v', '+', 'Verbose operation'],
     dump            => ['D', '+', 'Dump state at certain runpoint'],
 );
@@ -180,7 +181,7 @@ sub process_options
         $c->{check_request} = 0;
         $c->{check_response} = 0;
     }
-    
+
     if (! exists $c->{max_requests}) {
         if ($c->{max_time} > 0) {
             $c->{max_requests} = 0;
@@ -221,6 +222,22 @@ sub run_condition
         return 0;
     }
     return 1;
+}
+
+sub print
+{
+    my $c = shift;
+    unless ($c->{quiet}) {
+        print @_;
+    }
+}
+
+sub verbose
+{
+    my $c = shift;
+    if ($c->{verbose}) {
+        print @_;
+    }
 }
 
 1;
@@ -438,7 +455,7 @@ sub start
         LocalPort => $c->{'listen_port'},
         ReuseAddr => 1
     ) or die $c->{server_address}. ": $!\n";
-    print "Started HTTP server at " . $d->url . "\n";
+    $c->print("Started HTTP server at " . $d->url . "\n");
 
     %Daemon = %${\*$d};
     $DaemonFD = fileno($d);
@@ -482,6 +499,8 @@ sub worker_thread
         my $req;
         while ($req = $conn->get_request(HEADERS_ONLY)) {
             my $id = $req->header('X-Request-Id');
+            $c->verbose("S: got request ${id}\n");
+
             $test->{id} = $id;
             $conn->get_body($req, $test)
                 or Threads::die "Server failed to parse body!\n";
@@ -780,7 +799,7 @@ sub print
         use integer;
         $reqs_per_sec /= 1;
     }
-    print "Finished in $elpsd secs\n", "$reqs_per_sec requests/sec\n";
+    Config::get::print("Finished in $elpsd secs\n", "$reqs_per_sec requests/sec\n");
 }
 
 sub run_time
@@ -824,7 +843,7 @@ sub run
 {   
     my $c = Config::get();
 
-    print "Test: $c->{test}, started...\n";
+    $c->print("Test: $c->{test}, started...\n");
 
     $Watch->start;
 
@@ -1097,7 +1116,7 @@ sub send_request
 
     my $host = $req->header('Host');
     my $sock = IO::Socket::INET->new(
-        PeerAddr => $req->header('Host'),
+        PeerAddr => $c->{proxy_address} ? $c->{proxy_address} : $req->header('Host'),
         Proto => 'tcp'
     ) or Threads::die "connect: $!";
     setsockopt($sock, IPPROTO_TCP, TCP_NODELAY, 1);
@@ -1278,17 +1297,19 @@ sub send_request
     my $c = Config::get;
     my $ua = $self->{ua} || ($self->{ua} =
         Net::HTTP->new(
-            Host => $c->{server_address},
-            KeepAlive => $c->{keep_alive}));
+            Host => $c->{proxy_address} ? $c->{proxy_address} : $c->{server_address},
+            KeepAlive => $c->{keep_alive}))
+        or Threads::die "connect: $!";
 
     {
         my @method_url = (POST => '/');
         my @headers = (
+            Host => '127.0.0.1:888', #$c->{server_address},
             'User-Agent' => "Mozilla/5.0",
             'Content-Type' => 'application/octet-stream',
             'Transfer-Encoding' => 'chunked',
             'X-Request-Id' => $id);
-    
+
         $ua->write_request(@method_url, @headers)
             or Threads::die "write_request() failed!";
 
@@ -1304,6 +1325,8 @@ sub send_request
         while ($len = sysread $fh, $buf, 4096) {
             $ua->write_chunk($buf) or
                 Threads::die "write_chunk() failed!";
+
+            my $err = $!;
             if ($c->{check_request}) {
                 lock %SendBuf;
                 cond_wait $SendBufW, %SendBuf
@@ -1348,7 +1371,6 @@ sub chunk
         lock $SendBufW;
         cond_signal $SendBufW;
     }
-    
 
     my $sent_len = length $sent;
     if ($sent_len != $got_len) {
@@ -1357,7 +1379,7 @@ sub chunk
     if ($sent ne $chunk) {
         Threads::die "Request chunk content mismatch!\n";
     }
-    
+
     return $got_len;
 }
 

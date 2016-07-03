@@ -13,6 +13,9 @@
 #define Errno(...) \
     ErrnoEx(make_what_arg(__FILE__, __LINE__, ##__VA_ARGS__))
 
+#define Runtime(...) \
+    ErrnoEx(make_what_arg(__FILE__, __LINE__, ##__VA_ARGS__))
+
 template<class OStream, typename ... Any>
 void stream_all(OStream& out, Any ... args)
 {
@@ -34,6 +37,13 @@ class ErrnoEx : public std::system_error
 public:
     ErrnoEx(std::string what_arg)
         : std::system_error(errno, std::system_category(), what_arg) {}
+};
+
+class RuntimeEx : public std::runtime_error
+{
+public:
+    RuntimeEx(std::string what_arg)
+        : std::runtime_error(what_arg) {}
 };
 
 template<class OStream, class Object, typename ... Any>
