@@ -303,8 +303,7 @@ sub get_body
 
     my $buf = ${*$self}{'httpd_rbuf'};
     my $timeout = ${*$self}{'io_socket_timeout'};
-    my $fdset = "";
-    vec($fdset, $self->fileno, 1) = 1;
+    my $fdset = ${*$self}{'httpd_fdset'};
 
     # Find out how much content to read
     my $te  = $r->header('Transfer-Encoding');
@@ -436,6 +435,126 @@ sub get_body
     $r;
 }
 
+sub get_headers
+{
+    my($self, $waker_fd) = @_;
+    if (${*$self}{'httpd_nomore'}) {
+        $self->reason("No more requests from this connection");
+        return;
+    }
+
+    $self->reason("");
+    my $buf = ${*$self}{'httpd_rbuf'};
+    $buf = "" unless defined $buf;
+
+    my $timeout = $ {*$self}{'io_socket_timeout'};
+    my $fdset = "";
+    vec($fdset, $self->fileno, 1) = 1;
+    if ($waker_fd) {
+        vec($fdset, $waker_fd, 1) = 1;
+        ${*$self}{'waker_fd'} = $waker_fd;
+    }
+    ${*$self}{'httpd_fdset'} = $fdset;
+    local($_);
+
+  READ_HEADER:
+    while (1) {
+        # loop until we have the whole header in $buf
+        $buf =~ s/^(?:\015?\012)+//;  # ignore leading blank lines
+        if ($buf =~ /\012/) {  # potential, has at least one line
+            if ($buf =~ /^\w+[^\012]+HTTP\/\d+\.\d+\015?\012/) {
+                if ($buf =~ /\015?\012\015?\012/) {
+                    last READ_HEADER;  # we have it
+                }
+                elsif (length($buf) > 16*1024) {
+                    $self->send_error(413); # REQUEST_ENTITY_TOO_LARGE
+                    $self->reason("Very long header");
+                    return;
+                }
+            }
+            else {
+                last READ_HEADER;  # HTTP/0.9 client
+            }
+        }
+        elsif (length($buf) > 16*1024) {
+            $self->send_error(414); # REQUEST_URI_TOO_LARGE
+            $self->reason("Very long first line");
+            return;
+        }
+        print STDERR "Need more data for complete header\n" if $DEBUG;
+        return unless $self->_need_more($buf, $timeout, $fdset);
+    }
+    if ($buf !~ s/^(\S+)[ \t]+(\S+)(?:[ \t]+(HTTP\/\d+\.\d+))?[^\012]*\012//) {
+        ${*$self}{'httpd_client_proto'} = $HTTP_1_0;
+        $self->send_error(400);  # BAD_REQUEST
+        $self->reason("Bad request line: $buf");
+        return;
+    }
+    my $method = $1;
+    my $uri = $2;
+    my $proto = $3 || "HTTP/0.9";
+    $uri = "http://$uri" if $method eq "CONNECT";
+    $uri = $HTTP::URI_CLASS->new($uri, $self->daemon->url);
+    my $r = HTTP::Request->new($method, $uri);
+    $r->protocol($proto);
+    ${*$self}{'httpd_client_proto'} = $proto = HTTP::Daemon::ClientConn::_http_version($proto);
+    ${*$self}{'httpd_head'} = ($method eq "HEAD");
+
+    if ($proto >= $HTTP_1_0) {
+        # we expect to find some headers
+        my($key, $val);
+      HEADER:
+        while ($buf =~ s/^([^\012]*)\012//) {
+            $_ = $1;
+            s/\015$//;
+            if (/^([^:\s]+)\s*:\s*(.*)/) {
+                $r->push_header($key, $val) if $key;
+                ($key, $val) = ($1, $2);
+            }
+            elsif (/^\s+(.*)/) {
+                $val .= " $1";
+            }
+            else {
+                last HEADER;
+            }
+        }
+        $r->push_header($key, $val) if $key;
+    }
+
+    my $conn = $r->header('Connection');
+    if ($proto >= $HTTP_1_1) {
+        ${*$self}{'httpd_nomore'}++ if $conn && lc($conn) =~ /\bclose\b/;
+    }
+    else {
+        ${*$self}{'httpd_nomore'}++ unless $conn &&
+                                           lc($conn) =~ /\bkeep-alive\b/;
+    }
+
+    ${*$self}{'httpd_rbuf'} = $buf;
+    return $r;
+}
+
+sub _need_more
+{
+    my $self = shift;
+    #my($buf,$timeout,$fdset) = @_;
+    my($timeout, $fdset) = @_[1,2];
+    print STDERR "select(,,,$timeout)\n" if $DEBUG;
+    my $n = select(my $rout = $fdset,undef,undef,$timeout);
+    unless ($n) {
+        $self->reason(defined($n) ? "Timeout" : "select: $!");
+        return;
+    }
+    if (vec($rout, ${*$self}{'waker_fd'}, 1)) {
+        print STDERR "Exiting by waker\n" if $DEBUG;
+        return;
+    }
+    print STDERR "sysread()\n" if $DEBUG;
+    $n = sysread($self, $_[0], 2048, length($_[0]));
+    $self->reason(defined($n) ? "Client closed" : "sysread: $!") unless $n;
+    $n;
+}
+
 1;
 
 package Server;
@@ -453,6 +572,9 @@ my $RunS :shared;
 my %Daemon :shared;
 my $DaemonFD :shared;
 
+my ($WakerR, $WakerW);
+my $WakerFD :shared;
+
 sub start
 {
     my $c = Config::get();
@@ -465,7 +587,11 @@ sub start
 
     %Daemon = %${\*$d};
     $DaemonFD = fileno($d);
-    open my $fh, "+<&=$DaemonFD" or die $!;
+    open my $fh, "+<&=$DaemonFD" or die "open: $!";
+
+    pipe $WakerR, $WakerW
+        or die "pipe: $!";
+    $WakerFD = $WakerR->fileno;
 
     $RunS = 1;
     Threads::start($c->{server_threads}, \&worker_thread);
@@ -485,8 +611,6 @@ my %ResponsesSent :shared;
 my $WorkerThreads :shared;
 $WorkerThreads = 0;
 
-use constant HEADERS_ONLY => 1;
-
 sub worker_thread
 {
     {lock $WorkerThreads;
@@ -503,7 +627,7 @@ sub worker_thread
 
         $conn->autoflush(1);
         my $req;
-        while ($req = $conn->get_request(HEADERS_ONLY)) {
+        while ($req = $conn->get_headers($WakerFD)) {
             my $id = $req->header('X-Request-Id');
             $c->verbose("S: got request ${id}\n");
 
@@ -521,14 +645,17 @@ sub worker_thread
             my ($ok, $resp) = $test->send_response($id, $conn);
             Threads::die "$!" unless $ok;
 
-            $resp = freeze $resp;
             if ($c->{check_response}) {
+                $resp = freeze $resp;
                 lock %ResponsesSent;
                 $ResponsesSent{$id} = $resp;
                 cond_signal %ResponsesSent;
             }
         } # while ($conn->get_request())
         # FIXME: check errno
+        shutdown($conn, 2);
+        close $conn;
+        $conn = undef;
     }
     {lock $WorkerThreads;
     --$WorkerThreads;}
@@ -541,8 +668,14 @@ sub stop
     $RunS = 0;
     shutdown(get_daemon(), 2);
     while ($WorkerThreads) {
+        # NB: reader doesn't read from pipe!
+        # How this will behave on multiple threads?
+        print $WakerW "1";
+        $WakerW->flush;
         usleep 1;
     }
+    close $WakerW;
+    close $WakerR;
 }
 
 sub get_request
@@ -805,7 +938,7 @@ sub print
         use integer;
         $reqs_per_sec /= 1;
     }
-    Config::get::print("Finished in $elpsd secs\n", "$reqs_per_sec requests/sec\n");
+    Config::get->print("Finished in $elpsd secs\n", "$reqs_per_sec requests/sec\n");
 }
 
 sub run_time
@@ -926,9 +1059,18 @@ sub response_checker_thread
     my $t = $c->new_test;
     my $can_check = $t->can('check_response');
 
+    loop:
     while ($RunT) {
         my ($resp, $id) = Client::get_response(\$RunT)
             or next;
+
+        if ($resp->code ne RC_OK) {
+            $c->print("Unexpected response: ". $resp->message. " (". $resp->code. ")\n");
+            lock %Tests;
+            %Tests = ();
+            cond_signal %Tests;
+            last loop;
+        }
 
         if ($c->{check_response}) {
             my $sent = Server::get_response(\$RunT, $id)
@@ -1320,7 +1462,6 @@ sub send_request
             or Threads::die "write_request() failed!";
 
         if ($c->{check_request}) {
-            push @headers, Host => $c->{connect_address};
             Client::push_req_sent(HTTP::Request->new(@method_url, \@headers), $id);
         }
 
