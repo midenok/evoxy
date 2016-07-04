@@ -39,6 +39,7 @@ my %OPTIONS = (
     list            => ['l', '', 'List test types'],
     server_address  => ['s', '=s', 'Bind HTTP server to specified IP:PORT'],
     proxy_address   => ['p', '=s', 'IP:PORT of tested HTTP proxy'],
+    connect_address => ['c', '=s', 'Address to connect client to; defaults to --server-address'],
     no_proxy        => ['P', '', "Do not use proxy, instead send requests directly to server."],
     keep_alive      => ['k', '!', "Use persistent connections"],
     server_threads  => ['W', '=i', "Number of worker threads to spawn"],
@@ -170,13 +171,18 @@ sub process_options
     } else {
         $c->{server_address} = $c->{listen_ip}. ':'. $c->{listen_port};
     }
-    $c->{server_url} = "http://". $c->{server_address}. "/";
 
     if ($c->{no_proxy}) {
         undef $c->{proxy_address};
     } else {
         $c->{proxy_url} = "http://". $c->{proxy_address}. "/";
     }
+
+    if (! $c->{connect_address}) {
+        $c->{connect_address} = $c->{server_address};
+    }
+    $c->{connect_url} = "http://". $c->{connect_address}. "/";
+
     if ($c->{no_check}) {
         $c->{check_request} = 0;
         $c->{check_response} = 0;
@@ -1055,7 +1061,7 @@ sub build_request
     my $self = shift;
     my $id = shift;
     my $c = Config::get();
-    my $req = GET($c->{server_url}, X_Request_Id => $id);
+    my $req = GET($c->{connect_url}, X_Request_Id => $id);
     return $req;
 }
 
@@ -1145,7 +1151,7 @@ sub build_request
 GET / HTTP/1.1\r
 User-Agent: Wget/1.17.1 (cygwin)\r
 Accept: */*\r
-Host: $c->{server_address}\r
+Host: $c->{connect_address}\r
 X-Request-Id: ${request_id}\r
 X-Multi-Line-Header: line 1\r
  line 2\r
@@ -1185,7 +1191,7 @@ POST / HTTP/1.1\r
 User-Agent: Wget/1.17.1 (cygwin)\r
 Accept: */*\r
 Accept-Encoding: identity\r
-Host: $c->{server_address}\r
+Host: $c->{connect_address}\r
 X-Request-Id: ${request_id}\r
 Connection: Close\r
 Transfer-Encoding: chunked\r
@@ -1248,7 +1254,7 @@ sub build_request
     my $id = shift;
     my $c = Config::get();
     my $req = POST(
-        $c->{server_url},
+        $c->{connect_url},
         Content_Type => 'multipart/form-data',
         Content      => [ file => [ $c->{file} ] ],
         X_Request_Id => $id
@@ -1297,14 +1303,14 @@ sub send_request
     my $c = Config::get;
     my $ua = $self->{ua} || ($self->{ua} =
         Net::HTTP->new(
-            Host => $c->{proxy_address} ? $c->{proxy_address} : $c->{server_address},
+            Host => $c->{proxy_address} ? $c->{proxy_address} : $c->{connect_address},
             KeepAlive => $c->{keep_alive}))
         or Threads::die "connect: $!";
 
     {
         my @method_url = (POST => '/');
         my @headers = (
-            Host => '127.0.0.1:888', #$c->{server_address},
+            Host => $c->{connect_address},
             'User-Agent' => "Mozilla/5.0",
             'Content-Type' => 'application/octet-stream',
             'Transfer-Encoding' => 'chunked',
@@ -1314,7 +1320,7 @@ sub send_request
             or Threads::die "write_request() failed!";
 
         if ($c->{check_request}) {
-            push @headers, Host => $c->{server_address};
+            push @headers, Host => $c->{connect_address};
             Client::push_req_sent(HTTP::Request->new(@method_url, \@headers), $id);
         }
 

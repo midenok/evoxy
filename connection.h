@@ -204,6 +204,35 @@ public:
         return buffer.begin();
     }
 
+    IOBuffer& append(buffer::string &add)
+    {
+        size_t count = std::min(add.size(), free_size());
+        add.copy(const_cast<char *>(end()), count);
+        grow(count);
+        return *this;
+    }
+
+    IOBuffer& append(const char * add)
+    {
+        buffer::string str(add);
+        return append(str);
+    }
+
+    IOBuffer& append(int num)
+    {
+        char buf[sizeof(int) * 3 + 1];
+        size_t n = snprintf(buf, sizeof(int) * 3, "%d", num);
+        buffer::string str(buf, n);
+        return append(str);
+    }
+
+    template<typename ... Any>
+    IOBuffer& appendm(Any ... args)
+    {
+        int dummy[sizeof...(Any)] = { (append(args), 0)... };
+        return *this;
+    }
+
     Status recv(int fd, buffer::string &recv_chunk)
     {
         size_type free_size = IOBuffer::free_size();
@@ -319,6 +348,8 @@ public:
     void write_callback() override;
     void error_callback(int) override
     {}
+
+    void set_error(buffer::string &err, int err_no);
 };
 
 

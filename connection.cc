@@ -42,7 +42,8 @@ output buffer have: send_begin, send_size, write_begin, write_max
 input buffer have: recv_begin, recv_max, read_begin, read_
 */
 
-void ProxyFrontend::read_callback()
+void
+ProxyFrontend::read_callback()
 {
     buffer::string recv_chunk;
     // 'buffer' semantics is across multiple calls, recv_chunk points to last portion received
@@ -129,11 +130,12 @@ void ProxyFrontend::read_callback()
     } // switch (progress)
 }
 
-void ProxyFrontend::write_callback()
+void
+ProxyFrontend::write_callback()
 {
     if (buffer.empty()) {
         if (backend.buffer.empty()) {
-            if (progress == ProxyFrontend::RESPONSE_FINISHED) {
+            if (progress == RESPONSE_FINISHED) {
                 debug("Response finished!");
                 release();
                 return;
@@ -161,6 +163,15 @@ void ProxyFrontend::write_callback()
 }
 
 
+void
+ProxyFrontend::set_error(buffer::string& err, int err_no)
+{
+    buffer.reset();
+    buffer.appendm(err, strerror(err_no), " (", err_no, ")");
+    start_only_events(EV_WRITE);
+}
+
+
 ProxyBackend::ProxyBackend(ProxyFrontend& frontend_, struct ev_loop* event_loop_):
     OnEventLoop(event_loop_),
     buffer({ input_buf, buf_size }),
@@ -174,7 +185,8 @@ ProxyBackend::ProxyBackend(ProxyFrontend& frontend_, struct ev_loop* event_loop_
     conn_watcher.fd = sock_fd;
 }
 
-bool ProxyBackend::connect(const char* host, uint32_t port)
+bool
+ProxyBackend::connect(const char* host, uint32_t port)
 {
     struct sockaddr_in serv_addr;
     struct addrinfo hints, *res;
@@ -201,17 +213,34 @@ bool ProxyBackend::connect(const char* host, uint32_t port)
         return true;
     }
 
-    start_conn_watcher<connect_callback>();
+    // On connection error EV_READ is not activated without EV_WRITE...
+    start_conn_watcher<connect_callback>(EV_READ|EV_WRITE);
     return false;
 }
 
-void ProxyBackend::error_callback(int err)
+buffer::string BadGateway(
+    "HTTP/1.1 502 Bad Gateway\r\n"
+    "Connection: close\r\n"
+    "Content-Type: text/plain\r\n"
+    "\r\n"
+);
+
+void
+ProxyBackend::error_callback(int err)
 {
     debug("connect: ", strerror(err));
-    frontend.release();
+    if (frontend.progress != ProxyFrontend::REQUEST_FINISHED) {
+        frontend.release();
+    } else {
+        frontend.progress = ProxyFrontend::RESPONSE_FINISHED;
+        buffer.reset();
+        frontend.set_error(BadGateway, err);
+        stop_all_events();
+    }
 }
 
-void ProxyBackend::write_callback()
+void
+ProxyBackend::write_callback()
 {
     if (buffer.empty()) {
         if (frontend.buffer.empty()) {
@@ -239,7 +268,8 @@ void ProxyBackend::write_callback()
 }
 
 
-void ProxyBackend::read_callback()
+void
+ProxyBackend::read_callback()
 {
     buffer::string recv_chunk;
     IOBuffer::Status err = buffer.recv(conn_watcher.fd, recv_chunk);

@@ -14,7 +14,7 @@
     ErrnoEx(make_what_arg(__FILE__, __LINE__, ##__VA_ARGS__))
 
 #define Runtime(...) \
-    ErrnoEx(make_what_arg(__FILE__, __LINE__, ##__VA_ARGS__))
+    RuntimeEx(make_what_arg(__FILE__, __LINE__, ##__VA_ARGS__))
 
 template<class OStream, typename ... Any>
 void stream_all(OStream& out, Any ... args)
