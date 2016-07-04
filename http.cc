@@ -7,11 +7,70 @@
 const std::string CRLF("\r\n");
 const std::string WSP("\t ");
 const std::string LWSP("\t \r\n");
-const std::string HOST("host");
-const std::string CONTENT_LENGTH("content-length");
-const std::string TRANSFER_ENCODING("transfer-encoding");
 const std::string CHUNKED("chunked");
+const std::string NO_TRANSFORM("no-transform");
 const std::string MARKER_TERMINATORS(";\r");
+
+enum class Header;
+
+struct KnownHeaders
+{
+    static const
+    std::vector<std::string>
+        names;
+
+    static
+    Header find(buffer::istring& field);
+
+private:
+    static const char * _names[];
+    static const size_t _count;
+    static void assert_count();
+};
+
+enum class Header
+{
+    CACHE_CONTROL = 0,
+    CONTENT_LENGTH,
+    HOST,
+    TRANSFER_ENCODING,
+    VIA,
+    X_FORWARDED_FOR,
+    unknown /* must be the last element */
+};
+
+const char * KnownHeaders::_names[] = {
+    /* must be in order of enum! */
+        "cache-control",
+        "content-length",
+        "host",
+        "transfer-encoding",
+        "via",
+        "x-forwarded-for"
+};
+
+const size_t KnownHeaders::_count = sizeof(_names) / sizeof(_names[0]);
+
+Header KnownHeaders::find(buffer::istring& field)
+{
+    for (int i = 0; i < names.size(); ++i) {
+        if (names[i] == field) {
+            return Header(i);
+        }
+    }
+    return Header::unknown;
+}
+
+void KnownHeaders::assert_count()
+{
+    static_assert(_count == size_t (Header::unknown),
+        "KnownHeaders: enum and vector mismatch!");
+}
+
+const std::vector<std::string>
+KnownHeaders::names(_names, _names + _count);
+
+
 
 HTTPParser::HTTPParser(IOBuffer &input_buf_, IOBuffer &output_buf_) :
     parse_line { &HTTPParser::parse_request_line },
@@ -147,46 +206,56 @@ HTTPParser::parse_header_line()
         return TERMINATE;
     }
 
+    // TODO: optimization: eliminate uppercasing of static strings
+    buffer::istring name(found_line.begin(), cl);
+    Header header = KnownHeaders::find(name);
+
     // TODO: modify headers in output
     if (copy_found_line())
         return TERMINATE;
 
-    // TODO: optimization: eliminate uppercasing of static strings
-    buffer::istring name(found_line.begin(), cl);
 
-    if (name == HOST) {
-        if (get_header_value(host, cl))
-            return TERMINATE;
+    switch (header) {
+    case Header::HOST:
+        {
+            if (get_header_value(host, cl))
+                return TERMINATE;
 
-        cl = host.find(':');
-        if (cl != buffer::string::npos) {
-            if (cl + 1 < host.size()) {
-                buffer::string port_(&host[cl + 1], host.end());
-                port = buffer::stol(port_);
+            cl = host.find(':');
+            if (cl != buffer::string::npos) {
+                if (cl + 1 < host.size()) {
+                    buffer::string port_(&host[cl + 1], host.end());
+                    port = buffer::stol(port_);
+                }
+                host.assign(host.begin(), &host[cl]);
             }
-            host.assign(host.begin(), &host[cl]);
+            // fix host terminator to make getaddrinfo happy
+            assert(host.end() < found_line.end());
+            host_terminator = *host.end();
+            *const_cast<char*>(host.end()) = 0;
+            host_cstr = host.begin();
         }
-        // fix host terminator to make getaddrinfo happy
-        assert(host.end() < found_line.end());
-        host_terminator = *host.end();
-        *const_cast<char*>(host.end()) = 0;
-        host_cstr = host.begin();
-    }
-    else if (name == CONTENT_LENGTH) {
-        buffer::string content_length;
-        if (get_header_value(content_length, cl))
-            return TERMINATE;
+        break;
+    case Header::CONTENT_LENGTH:
+        {
+            buffer::string content_length;
+            if (get_header_value(content_length, cl))
+                return TERMINATE;
 
-        clength = buffer::stol(content_length);
-    }
-    else if (name == TRANSFER_ENCODING) {
-        buffer::istring transfer_encoding;
-        if (get_header_value(transfer_encoding, cl))
-            return TERMINATE;
-
-        if (transfer_encoding == CHUNKED) {
-            chunked = true;
+            clength = buffer::stol(content_length);
         }
+        break;
+    case Header::TRANSFER_ENCODING:
+        {
+            buffer::istring transfer_encoding;
+            if (get_header_value(transfer_encoding, cl))
+                return TERMINATE;
+
+            if (transfer_encoding == CHUNKED) {
+                chunked = true;
+            }
+        }
+        break;
     }
 
     return CONTINUE;
