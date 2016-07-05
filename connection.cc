@@ -1,15 +1,37 @@
 #include "pool.h"
 #include "connection.h"
+#include <arpa/inet.h>
 
 INIT_POOL(ProxyFrontend);
 INIT_POOL(BackendOnPool);
 
-ProxyFrontend::ProxyFrontend(struct ev_loop* event_loop_, int conn_fd):
+ProxyFrontend::ProxyFrontend(struct ev_loop* event_loop_, int conn_fd) :
     OnEventLoop(event_loop_, conn_fd),
-    buffer({input_buf, buf_size}),
+    buffer({ input_buf, buf_size }),
     backend(*this, event_loop_),
-    parser(buffer, backend.buffer)
+    parser(*this, buffer, backend.buffer)
 {
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname(conn_fd, (sockaddr *)&addr, &addr_len))
+        throw Errno("getsockname");
+    strncpy(local_addr_buf + 1, inet_ntoa(addr.sin_addr), sizeof(local_addr_buf) - 2);
+    local_addr_buf[0] = ' ';
+    local_addr_buf[sizeof(local_addr_buf) - 2] = 0;
+    size_t len = strlen(local_addr_buf);
+    local_addr_buf[len++] = '\r';
+    local_addr_buf[len++] = '\n';
+    local_address.assign(local_addr_buf, len);
+
+    addr_len = sizeof(addr);
+    if (getpeername(conn_fd, (sockaddr *) &addr, &addr_len))
+        throw Errno("getpeername");
+    strncpy(peer_addr_buf, inet_ntoa(addr.sin_addr), sizeof(peer_addr_buf) - 1);
+    peer_addr_buf[sizeof(peer_addr_buf) - 1] = 0;
+    len = strlen(peer_addr_buf);
+    peer_addr_buf[len++] = '\r';
+    peer_addr_buf[len++] = '\n';
+    peer_address.assign(peer_addr_buf, len);
 }
 
 /*
@@ -142,7 +164,7 @@ ProxyFrontend::write_callback()
                 // TODO: restart in case of Keep-Alive
                 // start_only_events(EV_READ);
             } else {
-                debug("Spurious write!");
+                debug("F: spurious write!");
             }
             return;
         }
@@ -213,7 +235,7 @@ ProxyBackend::connect(const char* host, uint32_t port)
         return true;
     }
 
-    // On connection error EV_READ is not activated without EV_WRITE...
+    // On connection error EV_READ is activated faster when you trying to write
     start_conn_watcher<connect_callback>(EV_READ|EV_WRITE);
     return false;
 }
@@ -245,9 +267,12 @@ ProxyBackend::write_callback()
     if (buffer.empty()) {
         if (frontend.buffer.empty()) {
             if (frontend.progress == ProxyFrontend::REQUEST_FINISHED) {
+                // maybe do this in ProxyFrontend::read_callback() ?
+                buffer.reset();
                 start_only_events(EV_READ);
+                frontend.progress = ProxyFrontend::RESPONSE_STARTED;
             } else {
-                debug("Spurious write!");
+                debug("B: spurious write!");
             }
             return;
         }
@@ -278,8 +303,8 @@ ProxyBackend::read_callback()
     case IOBuffer::BUFFER_FULL:
         return;
     case IOBuffer::SHUTDOWN:
-        // TODO: proper end of response detection
         stop_all_events();
+        // TODO: check protocol, content-length, etc. to warn if its illegal to shutdown now
         frontend.progress = ProxyFrontend::RESPONSE_FINISHED;
         return;
     case IOBuffer::OTHER_ERROR:
@@ -291,8 +316,62 @@ ProxyBackend::read_callback()
     }
 
     assert(frontend.progress >= ProxyFrontend::REQUEST_FINISHED);
-    if (frontend.progress == ProxyFrontend::REQUEST_FINISHED) {
-        frontend.progress = ProxyFrontend::RESPONSE_STARTED;
-        frontend.start_only_events(EV_WRITE);
-    }
+
+    HTTPParser::Status s;
+    switch (frontend.progress) {
+    case ProxyFrontend::RESPONSE_STARTED:
+        // Frontend EV_WRITE is stopped, so we can parse head chunk by chunk easy,
+        // until we finish the head (but limit is the same: buffer size) ...
+        s = frontend.parser.parse_head(recv_chunk);
+
+        switch (s) {
+        case HTTPParser::PROCEED: // reached head end
+            debug("Got response");
+            frontend.progress = ((frontend.parser.clength == 0 && !frontend.parser.chunked) ?
+                ProxyFrontend::RESPONSE_FINISHED :
+                ProxyFrontend::RESPONSE_HEAD_FINISHED);
+
+            // ... and start EV_WRITE when we finished the head.
+            frontend.start_only_events(EV_WRITE);
+
+            if (recv_chunk.empty())
+                return;
+
+            break;
+        case HTTPParser::TERMINATE:
+            error("Parsing HTTP response failed!");
+            frontend.release();
+            return;
+        case HTTPParser::CONTINUE:
+        default:
+            return;
+        } // switch (HTTPParser::Status)
+
+        if (frontend.progress == ProxyFrontend::RESPONSE_FINISHED)
+            goto RESPONSE_FINISHED;
+
+    case ProxyFrontend::RESPONSE_HEAD_FINISHED:
+        if (frontend.parser.chunked) {
+            s = frontend.parser.parse_body(recv_chunk);
+            switch (s) {
+            case HTTPParser::PROCEED: // reached body end
+                frontend.progress = ProxyFrontend::RESPONSE_FINISHED;
+                goto RESPONSE_FINISHED;
+            case HTTPParser::TERMINATE:
+                error("Parsing HTTP response body failed!");
+                frontend.release();
+                return;
+            case HTTPParser::CONTINUE:
+            default:
+                return;
+            } // switch (HTTPParser::Status)
+        }
+
+    case ProxyFrontend::RESPONSE_FINISHED:
+    RESPONSE_FINISHED:
+        // We can't disable READ, because any time peer can tear connection.
+        // In this case we need to tear backend ASAP!
+        // stop_events(EV_READ);
+        stop_all_events(); // FIXME: WRONG WRONG WRONG!
+    } // switch (progress)
 }

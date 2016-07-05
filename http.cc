@@ -22,6 +22,12 @@ struct KnownHeaders
     static
     Header find(buffer::istring& field);
 
+    static
+    const std::string& get (Header h)
+    {
+        return names[int(h)];
+    }
+
 private:
     static const char * _names[];
     static const size_t _count;
@@ -72,24 +78,67 @@ KnownHeaders::names(_names, _names + _count);
 
 
 
-HTTPParser::HTTPParser(IOBuffer &input_buf_, IOBuffer &output_buf_) :
+HTTPParser::HTTPParser(ProxyFrontend &frontend_, IOBuffer &input_buf_, IOBuffer &output_buf_) :
     parse_line { &HTTPParser::parse_request_line },
+    frontend { frontend_ },
     input_buf { input_buf_ },
     output_buf { output_buf_ }
 {
     reset();
 }
 
-bool HTTPParser::copy_found_line()
+bool HTTPParser::copy_line(const buffer::string &line)
 {
-    if (found_line.size() > output_buf.free_size()) {
+    if (line.size() > output_buf.free_size()) {
         error("Not enough space in output buffer!");
         return true;
     }
 
-    output_buf.grow(found_line.size());
-    found_line.copy(output_buf);
-    output_buf.shrink_front(found_line.size());
+    output_buf.grow(line.size());
+    line.copy(output_buf);
+    output_buf.shrink_front(line.size());
+    return false;
+}
+
+bool HTTPParser::copy_modified_headers()
+{
+    static const std::string via_h = KnownHeaders::get(Header::VIA) + ": ";
+    static const std::string xforw_h = KnownHeaders::get(Header::X_FORWARDED_FOR) + ": ";
+    static const std::string comma = ", ";
+
+    if (via.empty()) {
+        if (!no_transform) {
+            if (copy_line(via_h) ||
+                copy_line(http_version) ||
+                copy_line(frontend.local_address))
+                return true;
+        }
+    } else {
+        if (copy_line(via))
+            return true;
+        if (!no_transform) {
+            if (copy_line(comma) ||
+                copy_line(http_version) ||
+                copy_line(frontend.local_address))
+                return true;
+        }
+    }
+
+    if (x_forwarded_for.empty()) {
+        if (!no_transform) {
+            if (copy_line(xforw_h) ||
+                copy_line(frontend.peer_address))
+                return true;
+        }
+    } else {
+        if (copy_line(via))
+            return true;
+        if (!no_transform) {
+            if (copy_line(comma) ||
+                copy_line(frontend.peer_address))
+                return true;
+        }
+    }
     return false;
 }
 
@@ -156,11 +205,23 @@ HTTPParser::parse_request_line()
     request_uri.assign(&found_line[sp1], &found_line[sp2]);
     ++sp2;
     if (&found_line[sp2] >= found_line.end() - CRLF.size()) {
-        debug("Wrong request line: no HTTP-Version!");
+        debug("Wrong request line: no Protocol!");
         return TERMINATE;
     }
 
-    http_version.assign(&found_line[sp2], found_line.end() - CRLF.size());
+    size_t sl = found_line.find('/', sp2);
+    if (sl == buffer::string::npos) {
+        debug("Wrong request line: no slash in Protocol!");
+        return TERMINATE;
+    }
+
+    ++sl;
+    if (&found_line[sl] >= found_line.end() - CRLF.size()) {
+        debug("Wrong request line: no Protocol Version!");
+        return TERMINATE;
+    }
+
+    http_version.assign(&found_line[sl], found_line.end() - CRLF.size());
     parse_line = &HTTPParser::parse_header_line;
 
     if (copy_found_line())
@@ -193,68 +254,102 @@ HTTPParser::parse_header_line()
 {
     if (found_line.size() == CRLF.size()) {
         // found CRLFCRLF sequence
+
+        if (copy_modified_headers())
+            return TERMINATE;
+
         if (copy_found_line())
             return TERMINATE;
+
         input_buf.assign(found_line.end(), input_buf.end());
         output_buf.assign(output_buf.buffer_begin(), output_buf.end());
         return PROCEED;
     }
 
-    size_t cl = found_line.find(':');
-    if (cl == buffer::string::npos) {
+    size_t colon = found_line.find(':');
+    if (colon == buffer::string::npos) {
         debug("Wrong header line: no colon char!");
         return TERMINATE;
     }
 
-    // TODO: optimization: eliminate uppercasing of static strings
-    buffer::istring name(found_line.begin(), cl);
+    // Optimization: eliminate uppercasing of static strings
+    buffer::istring name(found_line.begin(), colon);
     Header header = KnownHeaders::find(name);
-
-    // TODO: modify headers in output
-    if (copy_found_line())
-        return TERMINATE;
-
 
     switch (header) {
     case Header::HOST:
-        {
-            if (get_header_value(host, cl))
-                return TERMINATE;
+    {
+        if (copy_found_line())
+            return TERMINATE;
 
-            cl = host.find(':');
-            if (cl != buffer::string::npos) {
-                if (cl + 1 < host.size()) {
-                    buffer::string port_(&host[cl + 1], host.end());
-                    port = buffer::stol(port_);
-                }
-                host.assign(host.begin(), &host[cl]);
+        if (get_header_value(host, colon))
+            return TERMINATE;
+
+        colon = host.find(':');
+        if (colon != buffer::string::npos) {
+            if (colon + 1 < host.size()) {
+                buffer::string port_(&host[colon + 1], host.end());
+                port = buffer::stol(port_);
             }
-            // fix host terminator to make getaddrinfo happy
-            assert(host.end() < found_line.end());
-            host_terminator = *host.end();
-            *const_cast<char*>(host.end()) = 0;
-            host_cstr = host.begin();
+            host.assign(host.begin(), &host[colon]);
         }
-        break;
+        // fix host terminator to make getaddrinfo happy
+        assert(host.end() < found_line.end());
+        host_terminator = *host.end();
+        *const_cast<char*>(host.end()) = 0;
+        host_cstr = host.begin();
+    }
+    break;
     case Header::CONTENT_LENGTH:
-        {
-            buffer::string content_length;
-            if (get_header_value(content_length, cl))
-                return TERMINATE;
+    {
+        if (copy_found_line())
+            return TERMINATE;
 
-            clength = buffer::stol(content_length);
+        buffer::string content_length;
+        if (get_header_value(content_length, colon))
+            return TERMINATE;
+
+        clength = buffer::stol(content_length);
+    }
+    break;
+    case Header::TRANSFER_ENCODING:
+    {
+        if (copy_found_line())
+            return TERMINATE;
+
+        buffer::istring transfer_encoding;
+        if (get_header_value(transfer_encoding, colon))
+            return TERMINATE;
+
+        if (transfer_encoding == CHUNKED) {
+            chunked = true;
+        }
+    }
+    break;
+    case Header::CACHE_CONTROL:
+    {
+        if (copy_found_line())
+            return TERMINATE;
+
+        buffer::istring cache_control;
+        if (get_header_value(cache_control, colon))
+            return TERMINATE;
+
+        if (cache_control == NO_TRANSFORM) {
+            no_transform = true;
         }
         break;
-    case Header::TRANSFER_ENCODING:
-        {
-            buffer::istring transfer_encoding;
-            if (get_header_value(transfer_encoding, cl))
-                return TERMINATE;
-
-            if (transfer_encoding == CHUNKED) {
-                chunked = true;
-            }
-        }
+    }
+    case Header::VIA:
+        via = found_line;
+        break;
+    case Header::X_FORWARDED_FOR:
+        x_forwarded_for = found_line;
+        break;
+    case Header::unknown:
+    default:
+        if (copy_found_line())
+            return TERMINATE;
         break;
     }
 
@@ -417,7 +512,7 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string &recv_chunk)
 
         // Now we are at the start (or in the middle) of chunk marker and need to find CRLF
         // to actually start skipping. But we have situation different (and worse)
-        // than in parse_head()! Now the buffer is not permanent: it may be taken by ParseBackend
+        // than in parse_head()! Now the buffer is not permanent: it may be taken for output
         // at any time! So the worst case scenario is: CR in the end of one buffer goes
         // away to ParseBackend and LF comes in another buffer. The more complication is:
         // actual marker also may be split by buffer boundaries. So, we need to collect it to some

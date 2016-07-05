@@ -629,6 +629,10 @@ sub worker_thread
         my $req;
         while ($req = $conn->get_headers($WakerFD)) {
             my $id = $req->header('X-Request-Id');
+            unless (defined $id) {
+                $c->verbose("S: no X-Request-Id!\n");
+                last;
+            }
             $c->verbose("S: got request ${id}\n");
 
             $test->{id} = $id;

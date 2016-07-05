@@ -4,6 +4,7 @@
 #include <string>
 #include "buffer_string.h"
 
+class ProxyFrontend;
 class IOBuffer;
 
 class HTTPParser
@@ -21,32 +22,42 @@ public:
 private:
     typedef Status(HTTPParser::*parse_f)();
     parse_f parse_line;
-    IOBuffer &input_buf;
-    IOBuffer &output_buf;
+    ProxyFrontend &frontend; // FIXME: duplicates input_buf on request
+    IOBuffer &input_buf; /* ProxyFrontend buffer on request, ProxyBackend buffer on response */
+    IOBuffer &output_buf; /* ProxyBackend buffer on request */
     buffer::string scan_buf;
     buffer::string scan_buf_store;
     buffer::string found_line;
     template <class STRING>
     bool get_header_value(STRING& value, size_t& cl);
 
-    bool copy_found_line();
+    /* copy headers into ProxyBackend buffer */
+    bool copy_line(const buffer::string &line);
+    bool copy_found_line()
+    {
+        return copy_line(found_line);
+    }
+    bool copy_modified_headers();
 
 public:
     buffer::string method;
     buffer::string request_uri;
     buffer::string http_version;
     buffer::string host;
+    buffer::string via;
+    buffer::string x_forwarded_for;
 
     const char* host_cstr;
     char host_terminator; // currently unused
     uint32_t port;
     uint32_t clength;
     bool chunked;
+    bool no_transform;
 
     bool next_line();
     Status parse_request_line();
     Status parse_header_line();
-    HTTPParser(IOBuffer &input_buf_, IOBuffer &output_buf_);
+    HTTPParser(ProxyFrontend &frontend, IOBuffer &input_buf_, IOBuffer &output_buf_);
     Status parse_head(buffer::string &recv_chunk);
     Status parse_body(buffer::string &recv_chunk);
 
@@ -81,6 +92,7 @@ public:
         marker_hoarder = 0;
         crlf_search = NO_SEARCH;
         body_end = false;
+        no_transform = false;
     }
 };
 

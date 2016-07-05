@@ -320,6 +320,7 @@ class ProxyFrontend :
     public OnPool<ProxyFrontend>,
     public virtual non_copyable // because of references in HTTPParser
 {
+    friend class HTTPParser;
     friend class ProxyBackend;
 
     enum Progress
@@ -338,6 +339,15 @@ protected:
     IOBuffer buffer;
     ProxyBackend backend;
     HTTPParser parser;
+
+    /* via header, with space at beginning, CRLF terminated */
+    char local_addr_buf[18]; // space: 1, ip: 15, CRLF: 2
+    buffer::string local_address;
+
+    /* x-forwarded-for header, CRLF terminated */
+    char peer_addr_buf[17]; // ip: 15, CRLF: 2
+    buffer::string peer_address;
+
     ssize_t sent_size = 0;
     Progress progress = REQUEST_STARTED;
 
