@@ -9,22 +9,33 @@ const std::string CRLF("\r\n");
 const std::string WSP("\t ");
 const std::string LWSP("\t \r\n");
 const std::string CHUNKED("chunked");
+const std::string KEEP_ALIVE("keep-alive");
+const std::string CLOSE("close");
 const std::string NO_TRANSFORM("no-transform");
 const std::string MARKER_TERMINATORS(";\r");
 
-enum class Header;
-
-struct KnownHeaders
+struct RequestHeader
 {
+    enum Id
+    {
+        CACHE_CONTROL = 0,
+        CONTENT_LENGTH,
+        HOST,
+        TRANSFER_ENCODING,
+        VIA,
+        X_FORWARDED_FOR,
+        unknown /* must be the last element */
+    };
+
     static const
     std::vector<std::string>
         names;
 
     static
-    Header find(buffer::istring& field);
+    Id find(buffer::istring& field);
 
     static
-    const std::string& get (Header h)
+    const std::string& get(Id h)
     {
         return names[int(h)];
     }
@@ -32,51 +43,99 @@ struct KnownHeaders
 private:
     static const char * _names[];
     static const size_t _count;
-    static void assert_count();
+
+    static
+    void assert_count();
 };
 
-enum class Header
+struct ResponseHeader
 {
-    CACHE_CONTROL = 0,
-    CONTENT_LENGTH,
-    HOST,
-    TRANSFER_ENCODING,
-    VIA,
-    X_FORWARDED_FOR,
-    unknown /* must be the last element */
+    enum Id
+    {
+        CONTENT_LENGTH = 0,
+        CONNECTION,
+        TRANSFER_ENCODING,
+        unknown /* must be the last element */
+    };
+
+    static const
+    std::vector<std::string>
+        names;
+
+    static
+    Id find(buffer::istring& field);
+
+    static
+    const std::string& get(Id h)
+    {
+        return names[int(h)];
+    }
+
+private:
+    static const char * _names[];
+    static const size_t _count;
+
+    static
+    void assert_count();
 };
 
-const char * KnownHeaders::_names[] = {
-    /* must be in order of enum! */
-        "cache-control",
-        "content-length",
-        "host",
-        "transfer-encoding",
-        "via",
-        "x-forwarded-for"
+const char * RequestHeader::_names[] = {
+/* must be in order of enum! */
+    "cache-control",
+    "content-length",
+    "host",
+    "transfer-encoding",
+    "via",
+    "x-forwarded-for"
 };
 
-const size_t KnownHeaders::_count = sizeof(_names) / sizeof(_names[0]);
+const char * ResponseHeader::_names[] = {
+/* must be in order of enum! */
+    "connection",
+    "content-length",
+    "transfer-encoding"
+};
 
-Header KnownHeaders::find(buffer::istring& field)
+const size_t RequestHeader::_count = sizeof(_names) / sizeof(_names[0]);
+const size_t ResponseHeader::_count = sizeof(_names) / sizeof(_names[0]);
+
+const std::vector<std::string>
+RequestHeader::names(_names, _names + _count);
+
+const std::vector<std::string>
+ResponseHeader::names(_names, _names + _count);
+
+RequestHeader::Id RequestHeader::find(buffer::istring& field)
 {
     for (int i = 0; i < names.size(); ++i) {
         if (names[i] == field) {
-            return Header(i);
+            return Id(i);
         }
     }
-    return Header::unknown;
+    return Id::unknown;
 }
 
-void KnownHeaders::assert_count()
+ResponseHeader::Id ResponseHeader::find(buffer::istring& field)
 {
-    static_assert(_count == size_t (Header::unknown),
-        "KnownHeaders: enum and vector mismatch!");
+    for (int i = 0; i < names.size(); ++i) {
+        if (names[i] == field) {
+            return Id(i);
+        }
+    }
+    return Id::unknown;
 }
 
-const std::vector<std::string>
-KnownHeaders::names(_names, _names + _count);
+void RequestHeader::assert_count()
+{
+    static_assert(_count == size_t(Id::unknown),
+        "RequestHeader: enum and vector mismatch!");
+}
 
+void ResponseHeader::assert_count()
+{
+    static_assert(_count == size_t(Id::unknown),
+        "ResponseHeader: enum and vector mismatch!");
+}
 
 
 HTTPParser::HTTPParser(IOBuffer &input_buf_, IOBuffer &output_buf_, int conn_fd) :
@@ -123,8 +182,8 @@ bool HTTPParser::copy_line(const buffer::string &line)
 
 bool HTTPParser::copy_modified_headers()
 {
-    static const std::string via_h = KnownHeaders::get(Header::VIA) + ": ";
-    static const std::string xforw_h = KnownHeaders::get(Header::X_FORWARDED_FOR) + ": ";
+    static const std::string via_h = RequestHeader::get(RequestHeader::VIA) + ": ";
+    static const std::string xforw_h = RequestHeader::get(RequestHeader::X_FORWARDED_FOR) + ": ";
     static const std::string comma = ", ";
 
     if (via.empty()) {
@@ -203,7 +262,7 @@ bool HTTPParser::next_line()
 HTTPParser::Status
 HTTPParser::parse_request_line()
 {
-    assert(!found_line.empty());
+    assert(found_line.size() >= CRLF.size());
     size_t sp1 = found_line.find(' ');
     if (sp1 == buffer::string::npos) {
         debug("Wrong request line: no space after Method!");
@@ -231,19 +290,20 @@ HTTPParser::parse_request_line()
         return TERMINATE;
     }
 
-    size_t sl = found_line.find('/', sp2);
-    if (sl == buffer::string::npos) {
+    size_t sep = found_line.find('/', sp2);
+    if (sep == buffer::string::npos) {
         debug("Wrong request line: no slash in Protocol!");
         return TERMINATE;
     }
 
-    ++sl;
-    if (&found_line[sl] >= found_line.end() - CRLF.size()) {
+    ++sep;
+    if (&found_line[sep] >= found_line.end() - CRLF.size()) {
         debug("Wrong request line: no Protocol Version!");
         return TERMINATE;
     }
 
-    http_version.assign(&found_line[sl], found_line.end() - CRLF.size());
+    http_version.assign(&found_line[sep], found_line.end() - CRLF.size());
+
     parse_line = &HTTPParser::parse_request_head;
 
     if (copy_found_line())
@@ -254,14 +314,40 @@ HTTPParser::parse_request_line()
 
 HTTPParser::Status HTTPParser::parse_response_line()
 {
-    assert(!found_line.empty());
-    size_t sp1 = found_line.find(' ');
+    assert(found_line.size() >= CRLF.size());
+    size_t sep = found_line.find('/');
+    if (sep == buffer::string::npos) {
+        debug("Wrong response line: no slash in HTTP-Version!");
+        return TERMINATE;
+    }
+
+    ++sep;
+    if (&found_line[sep] >= found_line.end() - CRLF.size()) {
+        debug("Wrong response line: no version in HTTP-Version!");
+        return TERMINATE;
+    }
+
+    size_t sp1 = found_line.find(' ', sep);
     if (sp1 == buffer::string::npos) {
         debug("Wrong response status line: no space after HTTP-Version!");
         return TERMINATE;
     }
 
-    http_version.assign(found_line.begin(), &found_line[sp1]);
+    http_version.assign(&found_line[sep], &found_line[sp1]);
+    sep = http_version.find('.');
+    if (sep != buffer::string::npos) {
+        buffer::string major, minor;
+        major.assign(http_version.begin(), &http_version[sep]);
+        minor.assign(&http_version[sep + 1], http_version.end());
+        version = buffer::stol(major) * 1000 + buffer::stol(minor);
+    } else {
+        version = buffer::stol(http_version) * 1000;
+    }
+
+    if (version > 1000) {
+        keep_alive = true;
+    }
+
     ++sp1;
     if (&found_line[sp1] >= found_line.end() - CRLF.size()) {
         debug("Wrong request line: no Status-Code!");
@@ -308,8 +394,12 @@ HTTPParser::get_header_value(STRING& value, size_t& cl)
 HTTPParser::Status
 HTTPParser::parse_request_head()
 {
+    assert(found_line.size() >= CRLF.size());
     if (found_line.size() == CRLF.size()) {
         // found CRLFCRLF sequence
+        if (!chunked) {
+            skip_chunk = content_length;
+        }
 
         if (copy_modified_headers())
             return TERMINATE;
@@ -324,16 +414,16 @@ HTTPParser::parse_request_head()
 
     size_t colon = found_line.find(':');
     if (colon == buffer::string::npos) {
-        debug("Wrong header line: no colon char!");
+        debug("Wrong request header line: no colon char!");
         return TERMINATE;
     }
 
     // Optimization: eliminate uppercasing of static strings
     buffer::istring name(found_line.begin(), colon);
-    Header header = KnownHeaders::find(name);
+    RequestHeader::Id header = RequestHeader::find(name);
 
     switch (header) {
-    case Header::HOST:
+    case RequestHeader::HOST:
     {
         if (copy_found_line())
             return TERMINATE;
@@ -354,21 +444,21 @@ HTTPParser::parse_request_head()
         host_terminator = *host.end();
         *const_cast<char*>(host.end()) = 0;
         host_cstr = host.begin();
+        break;
     }
-    break;
-    case Header::CONTENT_LENGTH:
+    case RequestHeader::CONTENT_LENGTH:
     {
         if (copy_found_line())
             return TERMINATE;
 
-        buffer::string content_length;
-        if (get_header_value(content_length, colon))
+        buffer::string clength;
+        if (get_header_value(clength, colon))
             return TERMINATE;
 
-        clength = buffer::stol(content_length);
+        content_length = buffer::stol(clength);
+        break;
     }
-    break;
-    case Header::TRANSFER_ENCODING:
+    case RequestHeader::TRANSFER_ENCODING:
     {
         if (copy_found_line())
             return TERMINATE;
@@ -380,9 +470,9 @@ HTTPParser::parse_request_head()
         if (transfer_encoding == CHUNKED) {
             chunked = true;
         }
+        break;
     }
-    break;
-    case Header::CACHE_CONTROL:
+    case RequestHeader::CACHE_CONTROL:
     {
         if (copy_found_line())
             return TERMINATE;
@@ -396,13 +486,13 @@ HTTPParser::parse_request_head()
         }
         break;
     }
-    case Header::VIA:
+    case RequestHeader::VIA:
         via = found_line;
         break;
-    case Header::X_FORWARDED_FOR:
+    case RequestHeader::X_FORWARDED_FOR:
         x_forwarded_for = found_line;
         break;
-    case Header::unknown:
+    case RequestHeader::unknown:
     default:
         if (copy_found_line())
             return TERMINATE;
@@ -414,6 +504,63 @@ HTTPParser::parse_request_head()
 
 HTTPParser::Status HTTPParser::parse_response_head()
 {
+    assert(found_line.size() >= CRLF.size());
+    if (found_line.size() == CRLF.size()) {
+        // found CRLFCRLF sequence
+        if (!chunked) {
+            skip_chunk = content_length;
+        }
+        return PROCEED;
+    }
+
+    size_t colon = found_line.find(':');
+    if (colon == buffer::string::npos) {
+        debug("Wrong response header line: no colon char!");
+        return TERMINATE;
+    }
+
+    buffer::istring name(found_line.begin(), colon);
+    ResponseHeader::Id header = ResponseHeader::find(name);
+
+    switch (header) {
+    case ResponseHeader::CONTENT_LENGTH:
+    {
+        buffer::string clength;
+        if (get_header_value(clength, colon))
+            return TERMINATE;
+
+        content_length = buffer::stol(clength);
+        break;
+    }
+    case ResponseHeader::TRANSFER_ENCODING:
+    {
+        buffer::istring transfer_encoding;
+        if (get_header_value(transfer_encoding, colon))
+            return TERMINATE;
+
+        if (transfer_encoding == CHUNKED) {
+            chunked = true;
+        }
+        break;
+    }
+    case ResponseHeader::CONNECTION:
+    {
+        buffer::istring connection;
+        if (get_header_value(connection, colon))
+            return TERMINATE;
+
+        if (connection == KEEP_ALIVE) {
+            keep_alive = true;
+        } else if (connection == CLOSE) {
+            keep_alive = false;
+        }
+
+        break;
+    }
+    default:
+        break;
+    }
+
     return CONTINUE;
 }
 
@@ -440,7 +587,7 @@ HTTPParser::Status HTTPParser::parse_head(buffer::string &recv_chunk)
     while (next_line()) {
         Status res = (this->*parse_line)();
         if (res != CONTINUE) {
-            recv_chunk = *input_buf;
+            recv_chunk.assign(found_line.end(), recv_chunk.end());
             return res;
         }
     }
@@ -542,7 +689,7 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string &recv_chunk)
                 crlf_search = TRAILER_CR_SEARCH;
                 continue;
             }
-            assert(recv_chunk.size() == 1);
+            // if (recv_chunk.size() > 1) - body is larger than expected!
             return PROCEED;
         case NO_SEARCH:
         default:
@@ -552,12 +699,18 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string &recv_chunk)
         if (skip_chunk >= recv_chunk.size()) {
             skip_chunk -= recv_chunk.size();
             if (skip_chunk == 0) {
+                if (!chunked)
+                    return PROCEED;
                 crlf_search = CHUNK_CR_EXPECT;
             }
             return CONTINUE;
         }
 
         if (skip_chunk > 0) {
+            if (!chunked) {
+                // Body is larger than expected!
+                return PROCEED;
+            }
             assert(marker_hoarder == 0);
             recv_chunk.shrink_front(skip_chunk);
             skip_chunk = 0;

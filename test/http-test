@@ -1215,6 +1215,8 @@ sub build_response
 {
     my $self = shift;
     my $request_id = shift;
+    
+    my $body = "OK\n";
 
     return HTTP::Response->new(
         RC_OK,
@@ -1224,9 +1226,10 @@ sub build_response
             'Content-Type' => 'text/plain',
             'Cache-Control' => 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0',
             'Pragma' => 'no-cache',
-            'Expires' => 'Thu, 01 Dec 1994 16:00:00 GMT'
+            'Expires' => 'Thu, 01 Dec 1994 16:00:00 GMT',
+            'Content-Length' => length $body
         ],
-        "OK\n"
+        $body
     );
 }
 

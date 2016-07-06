@@ -57,15 +57,17 @@ public:
     const char* host_cstr;
     char host_terminator; // currently unused
     bool no_transform;
+    uint32_t port;
 
     /* Response properties */ // TODO: put into union with Request properties
     buffer::string status_code;
     buffer::string reason_phrase;
+    bool keep_alive = false; // is not reset
+    unsigned version = 0; // is not reset
 
     /* Common properties */
     buffer::string http_version;
-    uint32_t port;
-    uint32_t clength;
+    uint32_t content_length;
     bool chunked;
 
     HTTPParser(IOBuffer &input_buf_, IOBuffer &output_buf_, int conn_fd);
@@ -102,7 +104,7 @@ public:
     void reset() // reset state to initial
     {
         port = 80;
-        clength = 0;
+        content_length = 0;
         chunked = false;
         skip_chunk = 0;
         marker_hoarder = 0;

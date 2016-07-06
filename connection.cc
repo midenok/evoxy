@@ -91,11 +91,11 @@ Proxy::Frontend::read_callback()
                 return;
             }
             debug("Got request ", parser.request_uri);
-            progress = ((parser.clength == 0 && !parser.chunked) ?
+            progress = ((parser.content_length == 0 && !parser.chunked) ?
                 REQUEST_FINISHED :
                 REQUEST_HEAD_FINISHED);
 
-            if (backend.connect(parser.host_cstr, parser.port)) {
+            if (!parser.keep_alive && backend.connect(parser.host_cstr, parser.port)) {
                 debug("Backend connection failed!");
                 proxy.release();
                 return;
@@ -118,21 +118,19 @@ Proxy::Frontend::read_callback()
             goto REQUEST_FINISHED;
 
     case REQUEST_HEAD_FINISHED:
-        if (parser.chunked) {
-            s = parser.parse_body(recv_chunk);
-            switch (s) {
-            case HTTPParser::PROCEED: // reached body end
-                progress = REQUEST_FINISHED;
-                goto REQUEST_FINISHED;
-            case HTTPParser::TERMINATE:
-                error("Parsing HTTP request body failed!");
-                proxy.release();
-                return;
-            case HTTPParser::CONTINUE:
-            default:
-                return;
-            } // switch (HTTPParser::Status)
-        }
+        s = parser.parse_body(recv_chunk);
+        switch (s) {
+        case HTTPParser::PROCEED: // reached body end
+            progress = REQUEST_FINISHED;
+            goto REQUEST_FINISHED;
+        case HTTPParser::TERMINATE:
+            error("Parsing HTTP request body failed!");
+            proxy.release();
+            return;
+        case HTTPParser::CONTINUE:
+        default:
+            return;
+        } // switch (HTTPParser::Status)
 
     case REQUEST_FINISHED:
     REQUEST_FINISHED:
@@ -150,10 +148,16 @@ Proxy::Frontend::write_callback()
         if (backend.buffer.empty()) {
             if (progress == RESPONSE_FINISHED) {
                 debug("Response finished!");
-                proxy.release();
+                if (parser.keep_alive) {
+                    parser.reset();
+                    buffer.reset();
+                    backend.buffer.reset();
+                    progress = REQUEST_STARTED;
+                    start_only_events(EV_READ);
+                } else {
+                    proxy.release();
+                }
                 return;
-                // TODO: restart in case of Keep-Alive
-                // start_only_events(EV_READ);
             } else {
                 debug("F: spurious write!");
             }
@@ -323,7 +327,7 @@ Proxy::Backend::read_callback()
         switch (s) {
         case HTTPParser::PROCEED: // reached head end
             debug("Got response");
-            progress = ((parser.clength == 0 && !parser.chunked) ?
+            progress = ((parser.content_length == 0 && !parser.chunked) ?
                 RESPONSE_FINISHED :
                 RESPONSE_HEAD_FINISHED);
 
@@ -347,21 +351,19 @@ Proxy::Backend::read_callback()
             goto RESPONSE_FINISHED;
 
     case RESPONSE_HEAD_FINISHED:
-        if (parser.chunked) {
-            s = parser.parse_body(recv_chunk);
-            switch (s) {
-            case HTTPParser::PROCEED: // reached body end
-                progress = RESPONSE_FINISHED;
-                goto RESPONSE_FINISHED;
-            case HTTPParser::TERMINATE:
-                error("Parsing HTTP response body failed!");
-                proxy.release();
-                return;
-            case HTTPParser::CONTINUE:
-            default:
-                return;
-            } // switch (HTTPParser::Status)
-        }
+        s = parser.parse_body(recv_chunk);
+        switch (s) {
+        case HTTPParser::PROCEED: // reached body end
+            progress = RESPONSE_FINISHED;
+            goto RESPONSE_FINISHED;
+        case HTTPParser::TERMINATE:
+            error("Parsing HTTP response body failed!");
+            proxy.release();
+            return;
+        case HTTPParser::CONTINUE:
+        default:
+            return;
+        } // switch (HTTPParser::Status)
 
     case RESPONSE_FINISHED:
     RESPONSE_FINISHED:
