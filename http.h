@@ -21,8 +21,8 @@ public:
 private:
     typedef Status(HTTPParser::*parse_f)();
     parse_f parse_line;
-    IOBuffer &input_buf; /* Proxy::Frontend buffer on request, Proxy::Backend buffer on response */
-    IOBuffer &output_buf; /* Proxy::Backend buffer on request */
+    IOBuffer *input_buf = nullptr; /* Proxy::Frontend buffer on request, Proxy::Backend buffer on response */
+    IOBuffer *output_buf = nullptr; /* Proxy::Backend buffer on request */
     buffer::string scan_buf;
     buffer::string scan_buf_store;
     buffer::string found_line;
@@ -47,26 +47,35 @@ private:
     bool copy_modified_headers();
 
 public:
+    /* Request properties */
     buffer::string method;
     buffer::string request_uri;
-    buffer::string http_version;
     buffer::string host;
     buffer::string via;
     buffer::string x_forwarded_for;
 
     const char* host_cstr;
     char host_terminator; // currently unused
+    bool no_transform;
+
+    /* Response properties */ // TODO: put into union with Request properties
+    buffer::string status_code;
+    buffer::string reason_phrase;
+
+    /* Common properties */
+    buffer::string http_version;
     uint32_t port;
     uint32_t clength;
     bool chunked;
-    bool no_transform;
 
-    bool next_line();
-    Status parse_request_line();
-    Status parse_header_line();
     HTTPParser(IOBuffer &input_buf_, IOBuffer &output_buf_, int conn_fd);
+    Status parse_request_line();
+    Status parse_response_line();
+    Status parse_request_head();
+    Status parse_response_head();
     Status parse_head(buffer::string &recv_chunk);
     Status parse_body(buffer::string &recv_chunk);
+    bool next_line();
 
     enum CRLFSearch
     {
@@ -100,6 +109,14 @@ public:
         crlf_search = NO_SEARCH;
         body_end = false;
         no_transform = false;
+    }
+
+    void start_response()
+    {
+        reset();
+        found_line.clear();
+        parse_line = &HTTPParser::parse_response_line;
+        input_buf = output_buf;
     }
 };
 

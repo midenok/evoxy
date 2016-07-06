@@ -81,8 +81,8 @@ KnownHeaders::names(_names, _names + _count);
 
 HTTPParser::HTTPParser(IOBuffer &input_buf_, IOBuffer &output_buf_, int conn_fd) :
     parse_line { &HTTPParser::parse_request_line },
-    input_buf { input_buf_ },
-    output_buf { output_buf_ }
+    input_buf { &input_buf_ },
+    output_buf { &output_buf_ }
 {
     reset();
     struct sockaddr_in addr;
@@ -110,14 +110,14 @@ HTTPParser::HTTPParser(IOBuffer &input_buf_, IOBuffer &output_buf_, int conn_fd)
 
 bool HTTPParser::copy_line(const buffer::string &line)
 {
-    if (line.size() > output_buf.free_size()) {
+    if (line.size() > output_buf->free_size()) {
         error("Not enough space in output buffer!");
         return true;
     }
 
-    output_buf.grow(line.size());
-    line.copy(output_buf);
-    output_buf.shrink_front(line.size());
+    output_buf->grow(line.size());
+    line.copy(*output_buf);
+    output_buf->shrink_front(line.size());
     return false;
 }
 
@@ -192,7 +192,7 @@ bool HTTPParser::next_line()
                 continue;
             }
         }
-        found_line.assign(found_line.empty() ? input_buf.begin() : found_line.end(), &scan_buf[crlf_end]);
+        found_line.assign(found_line.empty() ? input_buf->begin() : found_line.end(), &scan_buf[crlf_end]);
         // Can make scan_buf empty when request line ends exactly on chunk boundary:
         scan_buf.assign(&scan_buf[crlf_end], scan_buf.end());
         return true;
@@ -203,6 +203,7 @@ bool HTTPParser::next_line()
 HTTPParser::Status
 HTTPParser::parse_request_line()
 {
+    assert(!found_line.empty());
     size_t sp1 = found_line.find(' ');
     if (sp1 == buffer::string::npos) {
         debug("Wrong request line: no space after Method!");
@@ -212,7 +213,7 @@ HTTPParser::parse_request_line()
     method.assign(found_line.begin(), sp1);
     
     ++sp1;
-    if (&found_line[sp1] == found_line.end()) {
+    if (&found_line[sp1] >= found_line.end() - CRLF.size()) {
         debug("Wrong request line: no Request-URI!");
         return TERMINATE;
     }
@@ -243,11 +244,45 @@ HTTPParser::parse_request_line()
     }
 
     http_version.assign(&found_line[sl], found_line.end() - CRLF.size());
-    parse_line = &HTTPParser::parse_header_line;
+    parse_line = &HTTPParser::parse_request_head;
 
     if (copy_found_line())
         return TERMINATE;
 
+    return CONTINUE;
+}
+
+HTTPParser::Status HTTPParser::parse_response_line()
+{
+    assert(!found_line.empty());
+    size_t sp1 = found_line.find(' ');
+    if (sp1 == buffer::string::npos) {
+        debug("Wrong response status line: no space after HTTP-Version!");
+        return TERMINATE;
+    }
+
+    http_version.assign(found_line.begin(), &found_line[sp1]);
+    ++sp1;
+    if (&found_line[sp1] >= found_line.end() - CRLF.size()) {
+        debug("Wrong request line: no Status-Code!");
+        return TERMINATE;
+    }
+
+    size_t sp2 = found_line.find(' ', sp1);
+    if (sp2 == buffer::string::npos) {
+        debug("Wrong response status line: no space after Status-Code!");
+        return TERMINATE;
+    }
+
+    status_code.assign(&found_line[sp1], &found_line[sp2]);
+    ++sp2;
+    if (&found_line[sp2] >= found_line.end() - CRLF.size()) {
+        debug("Wrong request line: no Reason-Phrase!");
+        return TERMINATE;
+    }
+
+    reason_phrase.assign(&found_line[sp2], found_line.end() - CRLF.size());
+    parse_line = &HTTPParser::parse_response_head;
     return CONTINUE;
 }
 
@@ -271,7 +306,7 @@ HTTPParser::get_header_value(STRING& value, size_t& cl)
 }
 
 HTTPParser::Status
-HTTPParser::parse_header_line()
+HTTPParser::parse_request_head()
 {
     if (found_line.size() == CRLF.size()) {
         // found CRLFCRLF sequence
@@ -282,8 +317,8 @@ HTTPParser::parse_header_line()
         if (copy_found_line())
             return TERMINATE;
 
-        input_buf.assign(found_line.end(), input_buf.end());
-        output_buf.assign(output_buf.buffer_begin(), output_buf.end());
+        input_buf->assign(found_line.end(), input_buf->end());
+        output_buf->assign(output_buf->buffer_begin(), output_buf->end());
         return PROCEED;
     }
 
@@ -377,6 +412,10 @@ HTTPParser::parse_header_line()
     return CONTINUE;
 }
 
+HTTPParser::Status HTTPParser::parse_response_head()
+{
+    return CONTINUE;
+}
 
 HTTPParser::Status HTTPParser::parse_head(buffer::string &recv_chunk)
 {
@@ -385,14 +424,14 @@ HTTPParser::Status HTTPParser::parse_head(buffer::string &recv_chunk)
     if (!scan_buf_store.empty()) {
         scan_buf.assign(scan_buf_store.begin(), recv_chunk.end());
         scan_buf_store.clear();
-    } else if (recv_chunk.begin() > &input_buf[CRLF.size() - 1]) {
+    } else if (recv_chunk.begin() > &(*input_buf)[CRLF.size() - 1]) {
         // Position scan_buf to (recv_buf - CRLF.size() + 1):
         // full_buf already contains more than (CRLF.size() - 1) bytes,
         // we shift back recv_buf by this value. This is done for case
         // when beginning of recv_buf contains tail of CRLF (CRLF was split by 2 chunks).
         scan_buf.assign(&recv_chunk[1 - CRLF.size()], recv_chunk.end());
     } else {
-        scan_buf.assign(input_buf.begin(), recv_chunk.end());
+        scan_buf.assign(input_buf->begin(), recv_chunk.end());
     }
 
     if (scan_buf.size() < CRLF.size())
@@ -401,7 +440,7 @@ HTTPParser::Status HTTPParser::parse_head(buffer::string &recv_chunk)
     while (next_line()) {
         Status res = (this->*parse_line)();
         if (res != CONTINUE) {
-            recv_chunk = input_buf;
+            recv_chunk = *input_buf;
             return res;
         }
     }

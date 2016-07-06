@@ -266,6 +266,7 @@ Proxy::Backend::write_callback()
                 buffer.reset();
                 start_only_events(EV_READ);
                 progress = RESPONSE_STARTED;
+                parser.start_response();
             } else {
                 debug("B: spurious write!");
             }
