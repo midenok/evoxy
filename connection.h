@@ -71,7 +71,7 @@ private:
         ev_io_start(self->event_loop, &self->conn_watcher);
     }
 
-protected:
+public:
     void start_events(int events = 0)
     {
         if (events) {
@@ -106,6 +106,7 @@ protected:
         conn_watcher.events = 0;
     }
 
+protected:
     void check_socket()
     {
         socklen_t optlen = sizeof(int);
@@ -290,39 +291,9 @@ public:
 };
 
 
-class ProxyFrontend;
-
-class ProxyBackend :
-    public OnEventLoop,
-    public virtual non_copyable // because of references
+class Proxy :
+    public OnPool<Proxy>
 {
-    friend class ProxyFrontend;
-protected:
-    // TODO: test with buf_size = 1, 2, 3, etc.
-    static const size_t buf_size = 4096;
-    char input_buf[buf_size];
-    IOBuffer buffer;
-    ProxyFrontend &frontend;
-
-public:
-    ProxyBackend(ProxyFrontend& frontend_, struct ev_loop* event_loop_);
-
-    bool connect(const char* host, uint32_t port);
-
-    void read_callback() override;
-    void write_callback() override;
-    void error_callback(int err) override;
-};
-
-
-class ProxyFrontend :
-    public OnEventLoop,
-    public OnPool<ProxyFrontend>,
-    public virtual non_copyable // because of references in HTTPParser
-{
-    friend class HTTPParser;
-    friend class ProxyBackend;
-
     enum Progress
     {
         REQUEST_STARTED = 0,
@@ -333,40 +304,65 @@ class ProxyFrontend :
         RESPONSE_FINISHED
     };
 
-protected:
+    Progress progress = REQUEST_STARTED;
     static const size_t buf_size = 4096;
-    char input_buf[buf_size];
-    IOBuffer buffer;
-    ProxyBackend backend;
+    char buffer_holder[2][buf_size];
+    IOBuffer frontend_buffer;
+    IOBuffer backend_buffer;
     HTTPParser parser;
 
-    /* via header, with space at beginning, CRLF terminated */
-    char local_addr_buf[18]; // space: 1, ip: 15, CRLF: 2
-    buffer::string local_address;
+    struct Backend;
 
-    /* x-forwarded-for header, CRLF terminated */
-    char peer_addr_buf[17]; // ip: 15, CRLF: 2
-    buffer::string peer_address;
+    struct Frontend :
+        OnEventLoop,
+        virtual non_copyable // because of references in HTTPParser
+    {
+        // Proxy properties
+        Proxy &proxy;
+        Progress &progress;
+        HTTPParser &parser;
+        IOBuffer &buffer;
+        Backend &backend;
 
-    ssize_t sent_size = 0;
-    Progress progress = REQUEST_STARTED;
+        ssize_t sent_size = 0;
+
+        Frontend(struct ev_loop* event_loop_, int conn_fd, Proxy &proxy_);
+
+        void read_callback() override;
+        void write_callback() override;
+        void error_callback(int) override
+        {}
+
+        void set_error(const buffer::string &err, int err_no);
+    };
+
+    struct Backend :
+        OnEventLoop,
+        virtual non_copyable // because of references
+    {
+        // Proxy properties
+        Proxy &proxy;
+        Progress &progress;
+        HTTPParser &parser;
+        IOBuffer &buffer;
+        Frontend &frontend;
+
+        // TODO: test with buf_size = 1, 2, 3, etc.
+
+        Backend(struct ev_loop* event_loop_, Proxy &proxy_);
+
+        bool connect(const char* host, uint32_t port);
+
+        void read_callback() override;
+        void write_callback() override;
+        void error_callback(int err) override;
+    };
+
+    Frontend frontend;
+    Backend backend;
 
 public:
-    ProxyFrontend(struct ev_loop* event_loop_, int conn_fd);
-
-    void read_callback() override;
-    void write_callback() override;
-    void error_callback(int) override
-    {}
-
-    void set_error(buffer::string &err, int err_no);
-};
-
-
-class BackendOnPool :
-    public ProxyBackend,
-    public OnPool<BackendOnPool>
-{};
-
+    Proxy(struct ev_loop* event_loop_, int conn_fd);
+}; // class Connection
 
 #endif // __udtproxy_connection_h

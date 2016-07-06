@@ -3,6 +3,7 @@
 #include "http.h"
 #include "util.h"
 #include "connection.h"
+#include <arpa/inet.h>
 
 const std::string CRLF("\r\n");
 const std::string WSP("\t ");
@@ -78,13 +79,33 @@ KnownHeaders::names(_names, _names + _count);
 
 
 
-HTTPParser::HTTPParser(ProxyFrontend &frontend_, IOBuffer &input_buf_, IOBuffer &output_buf_) :
+HTTPParser::HTTPParser(IOBuffer &input_buf_, IOBuffer &output_buf_, int conn_fd) :
     parse_line { &HTTPParser::parse_request_line },
-    frontend { frontend_ },
     input_buf { input_buf_ },
     output_buf { output_buf_ }
 {
     reset();
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname(conn_fd, (sockaddr *) &addr, &addr_len))
+        throw Errno("getsockname");
+    strncpy(local_addr_buf + 1, inet_ntoa(addr.sin_addr), sizeof(local_addr_buf) - 2);
+    local_addr_buf[0] = ' ';
+    local_addr_buf[sizeof(local_addr_buf) - 2] = 0;
+    size_t len = strlen(local_addr_buf);
+    local_addr_buf[len++] = '\r';
+    local_addr_buf[len++] = '\n';
+    local_address.assign(local_addr_buf, len);
+
+    addr_len = sizeof(addr);
+    if (getpeername(conn_fd, (sockaddr *) &addr, &addr_len))
+        throw Errno("getpeername");
+    strncpy(peer_addr_buf, inet_ntoa(addr.sin_addr), sizeof(peer_addr_buf) - 1);
+    peer_addr_buf[sizeof(peer_addr_buf) - 1] = 0;
+    len = strlen(peer_addr_buf);
+    peer_addr_buf[len++] = '\r';
+    peer_addr_buf[len++] = '\n';
+    peer_address.assign(peer_addr_buf, len);
 }
 
 bool HTTPParser::copy_line(const buffer::string &line)
@@ -110,7 +131,7 @@ bool HTTPParser::copy_modified_headers()
         if (!no_transform) {
             if (copy_line(via_h) ||
                 copy_line(http_version) ||
-                copy_line(frontend.local_address))
+                copy_line(local_address))
                 return true;
         }
     } else {
@@ -119,7 +140,7 @@ bool HTTPParser::copy_modified_headers()
         if (!no_transform) {
             if (copy_line(comma) ||
                 copy_line(http_version) ||
-                copy_line(frontend.local_address))
+                copy_line(local_address))
                 return true;
         }
     }
@@ -127,7 +148,7 @@ bool HTTPParser::copy_modified_headers()
     if (x_forwarded_for.empty()) {
         if (!no_transform) {
             if (copy_line(xforw_h) ||
-                copy_line(frontend.peer_address))
+                copy_line(peer_address))
                 return true;
         }
     } else {
@@ -135,7 +156,7 @@ bool HTTPParser::copy_modified_headers()
             return true;
         if (!no_transform) {
             if (copy_line(comma) ||
-                copy_line(frontend.peer_address))
+                copy_line(peer_address))
                 return true;
         }
     }

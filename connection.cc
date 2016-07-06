@@ -1,37 +1,28 @@
 #include "pool.h"
 #include "connection.h"
-#include <arpa/inet.h>
 
-INIT_POOL(ProxyFrontend);
-INIT_POOL(BackendOnPool);
+INIT_POOL(Proxy);
 
-ProxyFrontend::ProxyFrontend(struct ev_loop* event_loop_, int conn_fd) :
-    OnEventLoop(event_loop_, conn_fd),
-    buffer({ input_buf, buf_size }),
-    backend(*this, event_loop_),
-    parser(*this, buffer, backend.buffer)
+Proxy::Proxy(struct ev_loop* event_loop_, int conn_fd) :
+    frontend_buffer({ buffer_holder[0], buf_size }),
+    backend_buffer({ buffer_holder[1], buf_size }),
+    parser(frontend_buffer, backend_buffer, conn_fd),
+    frontend(event_loop_, conn_fd, *this),
+    backend(event_loop_, *this)
 {
-    struct sockaddr_in addr;
-    socklen_t addr_len = sizeof(addr);
-    if (getsockname(conn_fd, (sockaddr *)&addr, &addr_len))
-        throw Errno("getsockname");
-    strncpy(local_addr_buf + 1, inet_ntoa(addr.sin_addr), sizeof(local_addr_buf) - 2);
-    local_addr_buf[0] = ' ';
-    local_addr_buf[sizeof(local_addr_buf) - 2] = 0;
-    size_t len = strlen(local_addr_buf);
-    local_addr_buf[len++] = '\r';
-    local_addr_buf[len++] = '\n';
-    local_address.assign(local_addr_buf, len);
+}
 
-    addr_len = sizeof(addr);
-    if (getpeername(conn_fd, (sockaddr *) &addr, &addr_len))
-        throw Errno("getpeername");
-    strncpy(peer_addr_buf, inet_ntoa(addr.sin_addr), sizeof(peer_addr_buf) - 1);
-    peer_addr_buf[sizeof(peer_addr_buf) - 1] = 0;
-    len = strlen(peer_addr_buf);
-    peer_addr_buf[len++] = '\r';
-    peer_addr_buf[len++] = '\n';
-    peer_address.assign(peer_addr_buf, len);
+Proxy::Frontend::Frontend(
+        struct ev_loop* event_loop_,
+        int conn_fd,
+        Proxy &proxy_) :
+    OnEventLoop(event_loop_, conn_fd),
+    proxy {proxy_},
+    progress {proxy.progress},
+    parser {proxy.parser},
+    buffer {proxy.frontend_buffer},
+    backend {proxy.backend}
+{
 }
 
 /*
@@ -45,18 +36,18 @@ positive response (see stop_events(), start_events()).
 Copying is done only on headers (because they must be changed for proxied requests).
 Data is transferred uncopied. Both buffers should be united for data copy.
 
-F::R: Client request head is received into ProxyFrontend buffer and simultaneously written to
-      ProxyBackend buffer (with some headers modification).
-F::R: After ProxyFrontend finishes receiving request head, it starts ProxyBackend EV_WRITE.
-F::R: ProxyFrontend keeps receiving request body into its buffer, until buffer is full.
-B::W: ProxyBackend keeps sending its buffer. When its buffer is empty, it swaps buffers with ProxyFrontend.
-F::R: When ProxyFrontend finishes receiving request body, it stops its EV_READ and sets REQUEST_FINISHED status.
-B::W: When both buffers are empty and status is REQUEST_FINISHED, ProxyBackend starts EV_READ.
-B::R: ProxyBackend keeps receiving Server response into its buffer. After first data received
-      it starts ProxyFrontend EV_WRITE.
-F::W: ProxyFrontend keeps sending its buffer. When its buffer is empty, it swaps buffers with ProxyBackend.
-B::R: When ProxyBackend finishes receiving response, it stops its EV_READ and sets RESPONSE_FINISHED status.
-F::W: When both buffers are empty and status is RESPONSE_FINISHED, ProxyFrontend either:
+F::R: Client request head is received into Proxy::Frontend buffer and simultaneously written to
+      Backend buffer (with some headers modification).
+F::R: After Proxy::Frontend finishes receiving request head, it starts Backend EV_WRITE.
+F::R: Proxy::Frontend keeps receiving request body into its buffer, until buffer is full.
+B::W: Backend keeps sending its buffer. When its buffer is empty, it swaps buffers with Proxy::Frontend.
+F::R: When Proxy::Frontend finishes receiving request body, it stops its EV_READ and sets REQUEST_FINISHED status.
+B::W: When both buffers are empty and status is REQUEST_FINISHED, Backend starts EV_READ.
+B::R: Backend keeps receiving Server response into its buffer. After first data received
+      it starts Proxy::Frontend EV_WRITE.
+F::W: Proxy::Frontend keeps sending its buffer. When its buffer is empty, it swaps buffers with Backend.
+B::R: When Backend finishes receiving response, it stops its EV_READ and sets RESPONSE_FINISHED status.
+F::W: When both buffers are empty and status is RESPONSE_FINISHED, Proxy::Frontend either:
     a) drops status, stops EV_WRITE and starts EV_READ in case of keepalive connection;
     b) terminates.
 
@@ -65,7 +56,7 @@ input buffer have: recv_begin, recv_max, read_begin, read_
 */
 
 void
-ProxyFrontend::read_callback()
+Proxy::Frontend::read_callback()
 {
     buffer::string recv_chunk;
     // 'buffer' semantics is across multiple calls, recv_chunk points to last portion received
@@ -75,12 +66,12 @@ ProxyFrontend::read_callback()
     case IOBuffer::BUFFER_FULL:
         if (progress < REQUEST_HEAD_FINISHED) {
             error("Not enough buffer to read request head!");
-            release();
+            proxy.release();
         }
         return;
     case IOBuffer::SHUTDOWN:
     case IOBuffer::OTHER_ERROR:
-        release();
+        proxy.release();
     case IOBuffer::WOULDBLOCK:
         return;
     default:
@@ -96,7 +87,7 @@ ProxyFrontend::read_callback()
         case HTTPParser::PROCEED: // reached head end
             if (parser.host.empty()) {
                 debug("No Host header in request!");
-                release();
+                proxy.release();
                 return;
             }
             debug("Got request ", parser.request_uri);
@@ -106,7 +97,7 @@ ProxyFrontend::read_callback()
 
             if (backend.connect(parser.host_cstr, parser.port)) {
                 debug("Backend connection failed!");
-                release();
+                proxy.release();
                 return;
             }
 
@@ -116,7 +107,7 @@ ProxyFrontend::read_callback()
             break;
         case HTTPParser::TERMINATE:
             error("Parsing HTTP request failed!");
-            release();
+            proxy.release();
             return;
         case HTTPParser::CONTINUE:
         default:
@@ -135,7 +126,7 @@ ProxyFrontend::read_callback()
                 goto REQUEST_FINISHED;
             case HTTPParser::TERMINATE:
                 error("Parsing HTTP request body failed!");
-                release();
+                proxy.release();
                 return;
             case HTTPParser::CONTINUE:
             default:
@@ -153,13 +144,13 @@ ProxyFrontend::read_callback()
 }
 
 void
-ProxyFrontend::write_callback()
+Proxy::Frontend::write_callback()
 {
     if (buffer.empty()) {
         if (backend.buffer.empty()) {
             if (progress == RESPONSE_FINISHED) {
                 debug("Response finished!");
-                release();
+                proxy.release();
                 return;
                 // TODO: restart in case of Keep-Alive
                 // start_only_events(EV_READ);
@@ -176,7 +167,7 @@ ProxyFrontend::write_callback()
     switch (err) {
     case IOBuffer::SHUTDOWN:
     case IOBuffer::OTHER_ERROR:
-        release();
+        proxy.release();
     case IOBuffer::WOULDBLOCK:
         return;
     default:
@@ -185,8 +176,7 @@ ProxyFrontend::write_callback()
 }
 
 
-void
-ProxyFrontend::set_error(buffer::string& err, int err_no)
+void Proxy::Frontend::set_error(const buffer::string &err, int err_no)
 {
     buffer.reset();
     buffer.appendm(err, strerror(err_no), " (", err_no, ")");
@@ -194,10 +184,15 @@ ProxyFrontend::set_error(buffer::string& err, int err_no)
 }
 
 
-ProxyBackend::ProxyBackend(ProxyFrontend& frontend_, struct ev_loop* event_loop_):
+Proxy::Backend::Backend(
+        struct ev_loop* event_loop_,
+        Proxy &proxy_) :
     OnEventLoop(event_loop_),
-    buffer({ input_buf, buf_size }),
-    frontend(frontend_)
+    proxy { proxy_ },
+    progress { proxy.progress },
+    parser { proxy.parser },
+    buffer { proxy.backend_buffer },
+    frontend { proxy.frontend }
 {
     int sock_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (sock_fd < 0) {
@@ -208,7 +203,7 @@ ProxyBackend::ProxyBackend(ProxyFrontend& frontend_, struct ev_loop* event_loop_
 }
 
 bool
-ProxyBackend::connect(const char* host, uint32_t port)
+Proxy::Backend::connect(const char* host, uint32_t port)
 {
     struct sockaddr_in serv_addr;
     struct addrinfo hints, *res;
@@ -240,7 +235,7 @@ ProxyBackend::connect(const char* host, uint32_t port)
     return false;
 }
 
-buffer::string BadGateway(
+const buffer::string BAD_GATEWAY(
     "HTTP/1.1 502 Bad Gateway\r\n"
     "Connection: close\r\n"
     "Content-Type: text/plain\r\n"
@@ -248,29 +243,29 @@ buffer::string BadGateway(
 );
 
 void
-ProxyBackend::error_callback(int err)
+Proxy::Backend::error_callback(int err)
 {
     debug("connect: ", strerror(err));
-    if (frontend.progress != ProxyFrontend::REQUEST_FINISHED) {
-        frontend.release();
+    if (progress != REQUEST_FINISHED) {
+        proxy.release();
     } else {
-        frontend.progress = ProxyFrontend::RESPONSE_FINISHED;
+        progress = RESPONSE_FINISHED;
         buffer.reset();
-        frontend.set_error(BadGateway, err);
+        frontend.set_error(BAD_GATEWAY, err);
         stop_all_events();
     }
 }
 
 void
-ProxyBackend::write_callback()
+Proxy::Backend::write_callback()
 {
     if (buffer.empty()) {
         if (frontend.buffer.empty()) {
-            if (frontend.progress == ProxyFrontend::REQUEST_FINISHED) {
-                // maybe do this in ProxyFrontend::read_callback() ?
+            if (progress == REQUEST_FINISHED) {
+                // maybe do this in read_callback() ?
                 buffer.reset();
                 start_only_events(EV_READ);
-                frontend.progress = ProxyFrontend::RESPONSE_STARTED;
+                progress = RESPONSE_STARTED;
             } else {
                 debug("B: spurious write!");
             }
@@ -284,7 +279,7 @@ ProxyBackend::write_callback()
     switch (err) {
     case IOBuffer::SHUTDOWN:
     case IOBuffer::OTHER_ERROR:
-        frontend.release();
+        proxy.release();
     case IOBuffer::WOULDBLOCK:
         return;
     default:
@@ -294,7 +289,7 @@ ProxyBackend::write_callback()
 
 
 void
-ProxyBackend::read_callback()
+Proxy::Backend::read_callback()
 {
     buffer::string recv_chunk;
     IOBuffer::Status err = buffer.recv(conn_watcher.fd, recv_chunk);
@@ -304,32 +299,32 @@ ProxyBackend::read_callback()
         return;
     case IOBuffer::SHUTDOWN:
         stop_all_events();
-        // TODO: check protocol, content-length, etc. to warn if its illegal to shutdown now
-        frontend.progress = ProxyFrontend::RESPONSE_FINISHED;
+        // TODO: check protocol, content-length, etc. to notify if its illegal to shutdown now
+        progress = RESPONSE_FINISHED;
         return;
     case IOBuffer::OTHER_ERROR:
-        frontend.release();
+        proxy.release();
     case IOBuffer::WOULDBLOCK:
         return;
     default:
         break;
     }
 
-    assert(frontend.progress >= ProxyFrontend::REQUEST_FINISHED);
+    assert(progress >= REQUEST_FINISHED);
 
     HTTPParser::Status s;
-    switch (frontend.progress) {
-    case ProxyFrontend::RESPONSE_STARTED:
+    switch (progress) {
+    case RESPONSE_STARTED:
         // Frontend EV_WRITE is stopped, so we can parse head chunk by chunk easy,
         // until we finish the head (but limit is the same: buffer size) ...
-        s = frontend.parser.parse_head(recv_chunk);
+        s = parser.parse_head(recv_chunk);
 
         switch (s) {
         case HTTPParser::PROCEED: // reached head end
             debug("Got response");
-            frontend.progress = ((frontend.parser.clength == 0 && !frontend.parser.chunked) ?
-                ProxyFrontend::RESPONSE_FINISHED :
-                ProxyFrontend::RESPONSE_HEAD_FINISHED);
+            progress = ((parser.clength == 0 && !parser.chunked) ?
+                RESPONSE_FINISHED :
+                RESPONSE_HEAD_FINISHED);
 
             // ... and start EV_WRITE when we finished the head.
             frontend.start_only_events(EV_WRITE);
@@ -340,26 +335,26 @@ ProxyBackend::read_callback()
             break;
         case HTTPParser::TERMINATE:
             error("Parsing HTTP response failed!");
-            frontend.release();
+            proxy.release();
             return;
         case HTTPParser::CONTINUE:
         default:
             return;
         } // switch (HTTPParser::Status)
 
-        if (frontend.progress == ProxyFrontend::RESPONSE_FINISHED)
+        if (progress == RESPONSE_FINISHED)
             goto RESPONSE_FINISHED;
 
-    case ProxyFrontend::RESPONSE_HEAD_FINISHED:
-        if (frontend.parser.chunked) {
-            s = frontend.parser.parse_body(recv_chunk);
+    case RESPONSE_HEAD_FINISHED:
+        if (parser.chunked) {
+            s = parser.parse_body(recv_chunk);
             switch (s) {
             case HTTPParser::PROCEED: // reached body end
-                frontend.progress = ProxyFrontend::RESPONSE_FINISHED;
+                progress = RESPONSE_FINISHED;
                 goto RESPONSE_FINISHED;
             case HTTPParser::TERMINATE:
                 error("Parsing HTTP response body failed!");
-                frontend.release();
+                proxy.release();
                 return;
             case HTTPParser::CONTINUE:
             default:
@@ -367,7 +362,7 @@ ProxyBackend::read_callback()
             } // switch (HTTPParser::Status)
         }
 
-    case ProxyFrontend::RESPONSE_FINISHED:
+    case RESPONSE_FINISHED:
     RESPONSE_FINISHED:
         // We can't disable READ, because any time peer can tear connection.
         // In this case we need to tear backend ASAP!

@@ -33,7 +33,7 @@ class AcceptTask : public Task
     // libev entities
     struct ev_loop *event_loop;
     ev_io accept_watcher;
-    typedef Pool<ProxyFrontend> ConnectionPool;
+    typedef Pool<Proxy> ConnectionPool;
     std::unique_ptr<ConnectionPool> pool;
 
     void
@@ -52,7 +52,7 @@ class AcceptTask : public Task
             return;
         }
         debug("got connection!");
-        new (*pool) ProxyFrontend(event_loop, conn_fd);
+        new (*pool) Proxy(event_loop, conn_fd);
     }
 
     static void
