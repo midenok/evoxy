@@ -24,6 +24,7 @@ class OnEventLoop :
 {
 protected:
     ev_io conn_watcher;
+    size_t spurious_reads = 0;
     size_t spurious_writes = 0;
 
 private:
@@ -31,9 +32,9 @@ private:
     ev_async async_watcher;
     bool async_task = false;
 
-    virtual void read_callback() = 0;
-    virtual void write_callback() = 0;
-    virtual void error_callback(int err) = 0;
+    virtual bool read_callback() = 0;
+    virtual bool write_callback() = 0;
+    virtual bool error_callback(int err) = 0;
 
     void terminate()
     {
@@ -52,9 +53,13 @@ private:
     {
         OnEventLoop *self = (OnEventLoop *)w->data;
         if (revents & EV_READ)
-            self->read_callback();
+            if (self->read_callback()) {
+                return;
+            }
         if (revents & EV_WRITE)
-            self->write_callback();
+            if (self->write_callback()) {
+                return;
+            }
     }
 
     static void
@@ -126,7 +131,9 @@ protected:
             throw Errno("getsockopt");
 
         if (sockerr) {
-            error_callback(sockerr);
+            if (error_callback(sockerr)) {
+                return;
+            }
         } else {
             ev_io_stop(event_loop, &conn_watcher);
             ev_io_init(&conn_watcher, conn_callback, conn_watcher.fd, EV_WRITE);
@@ -171,7 +178,7 @@ public:
     virtual ~OnEventLoop()
     {
         terminate();
-        debug("OnEventLoop destroying; spurious write events: ", spurious_writes);
+        debug("OnEventLoop destroying; spurious events: ", spurious_reads, " reads, ", spurious_writes, " writes");
     }
 };
 
@@ -247,7 +254,6 @@ public:
     {
         size_type free_size = IOBuffer::free_size();
         if (free_size == 0) {
-            debug("buffer full");
             return BUFFER_FULL;
         }
         ssize_t recv_size = ::recv(fd, const_cast<char*>(end()), free_size, 0);
@@ -338,10 +344,10 @@ class Proxy :
 
         Frontend(struct ev_loop* event_loop_, int conn_fd, Proxy &proxy_);
 
-        void read_callback() override;
-        void write_callback() override;
-        void error_callback(int) override
-        {}
+        bool read_callback() override;
+        bool write_callback() override;
+        bool error_callback(int) override
+        { return false; }
 
         void set_error(const buffer::string &err, int err_no);
     };
@@ -363,9 +369,9 @@ class Proxy :
 
         bool connect(const char* host, uint32_t port);
 
-        void read_callback() override;
-        void write_callback() override;
-        void error_callback(int err) override;
+        bool read_callback() override;
+        bool write_callback() override;
+        bool error_callback(int err) override;
     };
 
     Frontend frontend;

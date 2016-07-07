@@ -55,7 +55,7 @@ output buffer have: send_begin, send_size, write_begin, write_max
 input buffer have: recv_begin, recv_max, read_begin, read_
 */
 
-void
+bool
 Proxy::Frontend::read_callback()
 {
     buffer::string recv_chunk;
@@ -64,16 +64,20 @@ Proxy::Frontend::read_callback()
 
     switch (err) {
     case IOBuffer::BUFFER_FULL:
+        spurious_reads++;
         if (progress < REQUEST_HEAD_FINISHED) {
             error("F: not enough buffer to read request head!");
             proxy.release();
+            return true;
         }
-        return;
+        stop_events(EV_READ);
+        return false;
     case IOBuffer::SHUTDOWN:
     case IOBuffer::OTHER_ERROR:
         proxy.release();
+        return true;
     case IOBuffer::WOULDBLOCK:
-        return;
+        return false;
     default:
         break;
     }
@@ -88,7 +92,7 @@ Proxy::Frontend::read_callback()
             if (parser.host.empty()) {
                 debug("F: no Host header in request!");
                 proxy.release();
-                return;
+                return true;
             }
             debug("F: got request to ", parser.host, ", URI: ", parser.request_uri);
             progress = ((parser.content_length == 0 && !parser.chunked) ?
@@ -102,7 +106,7 @@ Proxy::Frontend::read_callback()
                 if (backend.connect(parser.host_cstr, parser.port)) {
                     debug("F: backend connection failed!");
                     proxy.release();
-                    return;
+                    return true;
                 }
                 debug("F: connected to ", parser.host_cstr, ":", parser.port);
             }
@@ -111,16 +115,16 @@ Proxy::Frontend::read_callback()
                 goto REQUEST_FINISHED;
 
             if (recv_chunk.empty())
-                return;
+                return false;
 
             break;
         case HTTPParser::TERMINATE:
             error("F: parsing HTTP request failed!");
             proxy.release();
-            return;
+            return true;
         case HTTPParser::CONTINUE:
         default:
-            return;
+            return false;
         } // switch (HTTPParser::Status)
 
     case REQUEST_HEAD_FINISHED:
@@ -134,11 +138,11 @@ Proxy::Frontend::read_callback()
         case HTTPParser::TERMINATE:
             error("F: parsing HTTP request body failed!");
             proxy.release();
-            return;
+            return true;
         case HTTPParser::CONTINUE:
         default:
             backend.start_events(EV_WRITE);
-            return;
+            return false;
         } // switch (HTTPParser::Status)
 
     case REQUEST_FINISHED:
@@ -148,9 +152,10 @@ Proxy::Frontend::read_callback()
         // stop_events(EV_READ);
         stop_all_events(); // FIXME: wrong!
     } // switch (progress)
+    return false;
 }
 
-void
+bool
 Proxy::Frontend::write_callback()
 {
     if (buffer.empty()) {
@@ -164,17 +169,18 @@ Proxy::Frontend::write_callback()
                     progress = REQUEST_STARTED;
                     debug("F: changed progress: ", progress);
                     start_only_events(EV_READ);
-                } else {
-                    proxy.release();
+                    return false;
                 }
-                return;
+                proxy.release();
+                return true;
             }
             spurious_writes++;
             stop_events(EV_WRITE);
-            return;
+            return false;
         }
         buffer.reset();
         std::swap(buffer, backend.buffer);
+        backend.start_events(EV_READ);
     }
 
     IOBuffer::Status err = buffer.send(conn_watcher.fd);
@@ -183,15 +189,18 @@ Proxy::Frontend::write_callback()
     case IOBuffer::SHUTDOWN:
     case IOBuffer::OTHER_ERROR:
         proxy.release();
+        return true;
     case IOBuffer::WOULDBLOCK:
-        return;
+        return false;
     default:
         break;
     }
+    return false;
 }
 
 
-void Proxy::Frontend::set_error(const buffer::string &err, int err_no)
+void
+Proxy::Frontend::set_error(const buffer::string &err, int err_no)
 {
     buffer.reset();
     buffer.appendm(err, strerror(err_no), " (", err_no, ")");
@@ -247,7 +256,7 @@ Proxy::Backend::connect(const char* host, uint32_t port)
 
     // On connection error EV_READ is activated faster when you trying to write
     start_conn_watcher<connect_callback>(EV_READ|EV_WRITE);
-    return false;
+    return false; // true means error
 }
 
 const buffer::string BAD_GATEWAY(
@@ -257,22 +266,23 @@ const buffer::string BAD_GATEWAY(
     "\r\n"
 );
 
-void
+bool
 Proxy::Backend::error_callback(int err)
 {
     debug("connect: ", strerror(err));
     if (progress != REQUEST_FINISHED) {
         proxy.release();
-    } else {
-        progress = RESPONSE_FINISHED;
-        debug("B: changed progress: ", progress);
-        buffer.reset();
-        frontend.set_error(BAD_GATEWAY, err);
-        stop_all_events();
+        return true;
     }
+    progress = RESPONSE_FINISHED;
+    debug("B: changed progress: ", progress);
+    buffer.reset();
+    frontend.set_error(BAD_GATEWAY, err);
+    stop_all_events();
+    return false;
 }
 
-void
+bool
 Proxy::Backend::write_callback()
 {
     if (buffer.empty()) {
@@ -288,10 +298,11 @@ Proxy::Backend::write_callback()
                 spurious_writes++;
                 stop_events(EV_WRITE);
             }
-            return;
+            return false;
         }
         buffer.reset();
         std::swap(buffer, frontend.buffer);
+        frontend.start_events(EV_READ);
     }
     IOBuffer::Status err = buffer.send(conn_watcher.fd);
 
@@ -299,15 +310,17 @@ Proxy::Backend::write_callback()
     case IOBuffer::SHUTDOWN:
     case IOBuffer::OTHER_ERROR:
         proxy.release();
+        return true;
     case IOBuffer::WOULDBLOCK:
-        return;
+        return false;
     default:
         break;
     }
+    return false;
 }
 
 
-void
+bool
 Proxy::Backend::read_callback()
 {
     buffer::string recv_chunk;
@@ -315,18 +328,21 @@ Proxy::Backend::read_callback()
 
     switch (err) {
     case IOBuffer::BUFFER_FULL:
-        return;
+        spurious_reads++;
+        stop_events(EV_READ);
+        return false;
     case IOBuffer::SHUTDOWN:
         stop_all_events();
         // TODO: check protocol, content-length, etc. to notify if its illegal to shutdown now
         progress = RESPONSE_FINISHED;
         debug("B: changed progress: ", progress);
         frontend.start_events(EV_WRITE);
-        return;
+        return false;
     case IOBuffer::OTHER_ERROR:
         proxy.release();
+        return true;
     case IOBuffer::WOULDBLOCK:
-        return;
+        return false;
     default:
         break;
     }
@@ -355,16 +371,16 @@ Proxy::Backend::read_callback()
                 goto RESPONSE_FINISHED;
 
             if (recv_chunk.empty())
-                return;
+                return false;
 
             break;
         case HTTPParser::TERMINATE:
             error("B: parsing HTTP response failed!");
             proxy.release();
-            return;
+            return true;
         case HTTPParser::CONTINUE:
         default:
-            return;
+            return false;
         } // switch (HTTPParser::Status)
 
     case RESPONSE_HEAD_FINISHED:
@@ -378,11 +394,11 @@ Proxy::Backend::read_callback()
         case HTTPParser::TERMINATE:
             error("B: parsing HTTP response body failed!");
             proxy.release();
-            return;
+            return true;
         case HTTPParser::CONTINUE:
         default:
             frontend.start_events(EV_WRITE);
-            return;
+            return false;
         } // switch (HTTPParser::Status)
 
     case RESPONSE_FINISHED:
@@ -392,4 +408,5 @@ Proxy::Backend::read_callback()
         // stop_events(EV_READ);
         stop_all_events(); // FIXME: WRONG WRONG WRONG!
     } // switch (progress)
+    return false;
 }
