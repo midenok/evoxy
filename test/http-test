@@ -168,9 +168,9 @@ sub process_options
         my @l = split(':', $c->{server_address});
         $c->{listen_ip} = $l[0] if $l[0];
         $c->{listen_port} = $l[1] if $l[1];
-    } else {
-        $c->{server_address} = $c->{listen_ip}. ':'. $c->{listen_port};
     }
+
+    $c->{server_address} = $c->{listen_ip}. ':'. $c->{listen_port};
 
     if ($c->{no_proxy}) {
         undef $c->{proxy_address};
@@ -672,7 +672,7 @@ sub stop
     $RunS = 0;
     shutdown(get_daemon(), 2);
     while ($WorkerThreads) {
-        # NB: reader doesn't read from pipe!
+        # NB:  doesn't read from pipe!
         # How this will behave on multiple threads?
         print $WakerW "1";
         $WakerW->flush;
@@ -1215,7 +1215,7 @@ sub build_response
 {
     my $self = shift;
     my $request_id = shift;
-    
+
     my $body = "OK\n";
 
     return HTTP::Response->new(

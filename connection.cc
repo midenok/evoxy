@@ -65,7 +65,7 @@ Proxy::Frontend::read_callback()
     switch (err) {
     case IOBuffer::BUFFER_FULL:
         if (progress < REQUEST_HEAD_FINISHED) {
-            error("Not enough buffer to read request head!");
+            error("F: not enough buffer to read request head!");
             proxy.release();
         }
         return;
@@ -86,27 +86,36 @@ Proxy::Frontend::read_callback()
         switch (s) {
         case HTTPParser::PROCEED: // reached head end
             if (parser.host.empty()) {
-                debug("No Host header in request!");
+                debug("F: no Host header in request!");
                 proxy.release();
                 return;
             }
-            debug("Got request ", parser.request_uri);
+            debug("F: got request to ", parser.host, ", URI: ", parser.request_uri);
             progress = ((parser.content_length == 0 && !parser.chunked) ?
                 REQUEST_FINISHED :
                 REQUEST_HEAD_FINISHED);
 
-            if (!parser.keep_alive && backend.connect(parser.host_cstr, parser.port)) {
-                debug("Backend connection failed!");
-                proxy.release();
-                return;
+            debug("F: changed progress: ", progress);
+            if (parser.keep_alive) {
+                backend.start_only_events(EV_WRITE);
+            } else {
+                if (backend.connect(parser.host_cstr, parser.port)) {
+                    debug("F: backend connection failed!");
+                    proxy.release();
+                    return;
+                }
+                debug("F: connected to ", parser.host_cstr, ":", parser.port);
             }
+
+            if (progress == REQUEST_FINISHED)
+                goto REQUEST_FINISHED;
 
             if (recv_chunk.empty())
                 return;
 
             break;
         case HTTPParser::TERMINATE:
-            error("Parsing HTTP request failed!");
+            error("F: parsing HTTP request failed!");
             proxy.release();
             return;
         case HTTPParser::CONTINUE:
@@ -114,17 +123,15 @@ Proxy::Frontend::read_callback()
             return;
         } // switch (HTTPParser::Status)
 
-        if (progress == REQUEST_FINISHED)
-            goto REQUEST_FINISHED;
-
     case REQUEST_HEAD_FINISHED:
         s = parser.parse_body(recv_chunk);
         switch (s) {
         case HTTPParser::PROCEED: // reached body end
             progress = REQUEST_FINISHED;
+            debug("F: changed progress: ", progress);
             goto REQUEST_FINISHED;
         case HTTPParser::TERMINATE:
-            error("Parsing HTTP request body failed!");
+            error("F: parsing HTTP request body failed!");
             proxy.release();
             return;
         case HTTPParser::CONTINUE:
@@ -147,25 +154,26 @@ Proxy::Frontend::write_callback()
     if (buffer.empty()) {
         if (backend.buffer.empty()) {
             if (progress == RESPONSE_FINISHED) {
-                debug("Response finished!");
+                debug("F: Response finished!");
                 if (parser.keep_alive) {
-                    parser.reset();
+                    parser.restart_request(buffer);
                     buffer.reset();
                     backend.buffer.reset();
                     progress = REQUEST_STARTED;
+                    debug("F: changed progress: ", progress);
                     start_only_events(EV_READ);
                 } else {
                     proxy.release();
                 }
                 return;
-            } else {
-                debug("F: spurious write!");
             }
+            spurious_writes++;
             return;
         }
         buffer.reset();
         std::swap(buffer, backend.buffer);
     }
+
     IOBuffer::Status err = buffer.send(conn_watcher.fd);
 
     switch (err) {
@@ -254,6 +262,7 @@ Proxy::Backend::error_callback(int err)
         proxy.release();
     } else {
         progress = RESPONSE_FINISHED;
+        debug("B: changed progress: ", progress);
         buffer.reset();
         frontend.set_error(BAD_GATEWAY, err);
         stop_all_events();
@@ -270,9 +279,10 @@ Proxy::Backend::write_callback()
                 buffer.reset();
                 start_only_events(EV_READ);
                 progress = RESPONSE_STARTED;
+                debug("B: changed progress: ", progress);
                 parser.start_response();
             } else {
-                debug("B: spurious write!");
+                spurious_writes++;
             }
             return;
         }
@@ -306,6 +316,7 @@ Proxy::Backend::read_callback()
         stop_all_events();
         // TODO: check protocol, content-length, etc. to notify if its illegal to shutdown now
         progress = RESPONSE_FINISHED;
+        debug("B: changed progress: ", progress);
         return;
     case IOBuffer::OTHER_ERROR:
         proxy.release();
@@ -326,20 +337,24 @@ Proxy::Backend::read_callback()
 
         switch (s) {
         case HTTPParser::PROCEED: // reached head end
-            debug("Got response");
+            debug("B: got response: ", parser.status_code, ' ', parser.reason_phrase);
             progress = ((parser.content_length == 0 && !parser.chunked) ?
                 RESPONSE_FINISHED :
                 RESPONSE_HEAD_FINISHED);
+            debug("B: changed progress: ", progress);
 
             // ... and start EV_WRITE when we finished the head.
             frontend.start_only_events(EV_WRITE);
+
+            if (progress == RESPONSE_FINISHED)
+                goto RESPONSE_FINISHED;
 
             if (recv_chunk.empty())
                 return;
 
             break;
         case HTTPParser::TERMINATE:
-            error("Parsing HTTP response failed!");
+            error("B: parsing HTTP response failed!");
             proxy.release();
             return;
         case HTTPParser::CONTINUE:
@@ -347,17 +362,15 @@ Proxy::Backend::read_callback()
             return;
         } // switch (HTTPParser::Status)
 
-        if (progress == RESPONSE_FINISHED)
-            goto RESPONSE_FINISHED;
-
     case RESPONSE_HEAD_FINISHED:
         s = parser.parse_body(recv_chunk);
         switch (s) {
         case HTTPParser::PROCEED: // reached body end
             progress = RESPONSE_FINISHED;
+            debug("B: changed progress: ", progress);
             goto RESPONSE_FINISHED;
         case HTTPParser::TERMINATE:
-            error("Parsing HTTP response body failed!");
+            error("B: parsing HTTP response body failed!");
             proxy.release();
             return;
         case HTTPParser::CONTINUE:

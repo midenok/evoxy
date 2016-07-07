@@ -64,12 +64,12 @@ void debug_message(OStream& out, char q1, const char* file, int line, char q2, O
 #else // !NDEBUG
 #define debug(...) \
 if (ENABLED_OPT(VERBOSE)) \
-    debug_message(std::cout, '{', __FILE__, __LINE__, '}', this, __VA_ARGS__)
+    debug_message(std::cout, '{', __FILE__, __LINE__, '}', this, __FUNCTION__, "(): ", __VA_ARGS__)
 #define cdebug(...) \
 if (ENABLED_OPT(VERBOSE)) \
-    debug_message(std::cout, '{', __FILE__, __LINE__, '}', __VA_ARGS__)
-#define error(...)  debug_message(std::cerr, '#', __FILE__, __LINE__, '#', this, __VA_ARGS__)
-#define cerror(...)  debug_message(std::cerr, '#', __FILE__, __LINE__, '#', __VA_ARGS__)
+    debug_message(std::cout, '{', __FILE__, __LINE__, '}', __FUNCTION__, "(): ", __VA_ARGS__)
+#define error(...)  debug_message(std::cerr, '#', __FILE__, __LINE__, '#', this, __FUNCTION__, "(): ", __VA_ARGS__)
+#define cerror(...)  debug_message(std::cerr, '#', __FILE__, __LINE__, '#', __FUNCTION__, "(): ", __VA_ARGS__)
 #endif // NDEBUG
 
 class non_copyable

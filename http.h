@@ -99,9 +99,8 @@ private:
 
     CRLFSearch crlf_search;
 
-public:
-    // FIXME: reset() on RESPONSE_FINISHED
-    void reset() // reset state to initial
+    // reset state to initial
+    void reset()
     {
         port = 80;
         content_length = 0;
@@ -113,11 +112,21 @@ public:
         no_transform = false;
     }
 
+ public:
+    void restart_request(IOBuffer &buffer)
+    {
+        reset();
+        found_line.clear();
+        parse_line = &HTTPParser::parse_request_line;
+        input_buf = &buffer;
+    }
+
     void start_response()
     {
         reset();
         found_line.clear();
         parse_line = &HTTPParser::parse_response_line;
+        // NB: vague buffer swap logic is prone to errors
         input_buf = output_buf;
     }
 };

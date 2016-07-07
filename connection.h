@@ -24,6 +24,7 @@ class OnEventLoop :
 {
 protected:
     ev_io conn_watcher;
+    size_t spurious_writes = 0;
 
 private:
     struct ev_loop *event_loop;
@@ -72,38 +73,20 @@ private:
     }
 
 public:
-    void start_events(int events = 0)
-    {
-        if (events) {
-            if (conn_watcher.events)
-                ev_io_stop(event_loop, &conn_watcher);
-            conn_watcher.events |= events;
-        }
-        ev_io_start(event_loop, &conn_watcher);
-    }
-
-    void stop_events(int events = 0)
-    {
-        ev_io_stop(event_loop, &conn_watcher);
-        if (events) {
-            conn_watcher.events &= ~events;
-            if (conn_watcher.events)
-                ev_io_start(event_loop, &conn_watcher);
-        }
-    }
-
     void start_only_events(int events)
     {
         if (conn_watcher.events)
             ev_io_stop(event_loop, &conn_watcher);
         conn_watcher.events = events;
         ev_io_start(event_loop, &conn_watcher);
+        debug("started events: ", events);
     }
 
     void stop_all_events()
     {
         ev_io_stop(event_loop, &conn_watcher);
         conn_watcher.events = 0;
+        debug("stopped all events");
     }
 
 protected:
@@ -161,10 +144,9 @@ public:
     virtual ~OnEventLoop()
     {
         terminate();
-        debug("OnEventLoop destroying");
+        debug("OnEventLoop destroying; spurious write events: ", spurious_writes);
     }
 };
-
 
 class IOBuffer : public buffer::string
 {
@@ -285,11 +267,12 @@ public:
         if (sent_size == 0)
             return WOULDBLOCK; // unexpected
 
+        // debug("sent ", sent_size, " bytes");
+
         shrink_front(sent_size);
         return OK;
     }
 };
-
 
 class Proxy :
     public OnPool<Proxy>
