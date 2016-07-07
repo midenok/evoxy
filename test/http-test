@@ -766,7 +766,7 @@ $ClientThreads = 0;
 sub push_req_sent
 {
     my $req = $_[0];
-    my $id = $_[1] || $req->header('X-Request-Id');
+    my $id = $_[3] || $req->header('X-Request-Id');
     my $frozen = freeze $req;
     {
         lock %ReqSent;
@@ -1266,7 +1266,7 @@ sub send_request
     my $req = HTTP::Request->parse(join('', @chunks));
 
     if ($c->{check_request}) {
-        $self->push_req_sent($req, $id);
+        $self->push_req_sent($req, undef, undef, $id);
     }
 
     my $host = $req->header('Host');
@@ -1469,7 +1469,7 @@ sub send_request
             or Threads::die "write_request() failed!";
 
         if ($c->{check_request}) {
-            Client::push_req_sent(HTTP::Request->new(@method_url, \@headers), $id);
+            Client::push_req_sent(HTTP::Request->new(@method_url, \@headers), undef, undef, $id);
         }
 
         open my $fh, "<", $c->{file}
