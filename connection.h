@@ -73,6 +73,33 @@ private:
     }
 
 public:
+    void start_events(int events)
+    {
+        if (conn_watcher.events & events)
+            return;
+
+        ev_io_stop(event_loop, &conn_watcher);
+        conn_watcher.events |= events;
+        ev_io_start(event_loop, &conn_watcher);
+        debug("started events: ", events, "; running: ", conn_watcher.events);
+    }
+
+    void stop_events(int events)
+    {
+        if (conn_watcher.events & events == 0)
+            return;
+
+        ev_io_stop(event_loop, &conn_watcher);
+        conn_watcher.events &= ~events;
+
+        if (conn_watcher.events) {
+            ev_io_start(event_loop, &conn_watcher);
+            debug("stopped events: ", events, "; running: ", conn_watcher.events);
+        } else {
+            debug("stopped events: ", events, "; no events running");
+        }
+    }
+
     void start_only_events(int events)
     {
         if (conn_watcher.events)

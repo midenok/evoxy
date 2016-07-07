@@ -129,6 +129,7 @@ Proxy::Frontend::read_callback()
         case HTTPParser::PROCEED: // reached body end
             progress = REQUEST_FINISHED;
             debug("F: changed progress: ", progress);
+            backend.start_events(EV_WRITE);
             goto REQUEST_FINISHED;
         case HTTPParser::TERMINATE:
             error("F: parsing HTTP request body failed!");
@@ -136,6 +137,7 @@ Proxy::Frontend::read_callback()
             return;
         case HTTPParser::CONTINUE:
         default:
+            backend.start_events(EV_WRITE);
             return;
         } // switch (HTTPParser::Status)
 
@@ -168,6 +170,7 @@ Proxy::Frontend::write_callback()
                 return;
             }
             spurious_writes++;
+            stop_events(EV_WRITE);
             return;
         }
         buffer.reset();
@@ -283,6 +286,7 @@ Proxy::Backend::write_callback()
                 parser.start_response();
             } else {
                 spurious_writes++;
+                stop_events(EV_WRITE);
             }
             return;
         }
@@ -317,6 +321,7 @@ Proxy::Backend::read_callback()
         // TODO: check protocol, content-length, etc. to notify if its illegal to shutdown now
         progress = RESPONSE_FINISHED;
         debug("B: changed progress: ", progress);
+        frontend.start_events(EV_WRITE);
         return;
     case IOBuffer::OTHER_ERROR:
         proxy.release();
@@ -368,6 +373,7 @@ Proxy::Backend::read_callback()
         case HTTPParser::PROCEED: // reached body end
             progress = RESPONSE_FINISHED;
             debug("B: changed progress: ", progress);
+            frontend.start_events(EV_WRITE);
             goto RESPONSE_FINISHED;
         case HTTPParser::TERMINATE:
             error("B: parsing HTTP response body failed!");
@@ -375,6 +381,7 @@ Proxy::Backend::read_callback()
             return;
         case HTTPParser::CONTINUE:
         default:
+            frontend.start_events(EV_WRITE);
             return;
         } // switch (HTTPParser::Status)
 
