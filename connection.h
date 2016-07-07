@@ -78,7 +78,14 @@ private:
     }
 
 public:
+
+#ifdef NDEBUG
     void start_events(int events)
+#else
+#define start_events(EVENTS) \
+    start_events_(EVENTS, __PRETTY_FUNCTION__)
+    void start_events_(int events, const char* caller_name)
+#endif
     {
         if (conn_watcher.events & events)
             return;
@@ -86,10 +93,16 @@ public:
         ev_io_stop(event_loop, &conn_watcher);
         conn_watcher.events |= events;
         ev_io_start(event_loop, &conn_watcher);
-        debug("started events: ", events, "; running: ", conn_watcher.events);
+        debug("started events: ", events, "; running: ", conn_watcher.events, " [", caller_name, "]");
     }
 
+#ifdef NDEBUG
     void stop_events(int events)
+#else
+#define stop_events(EVENTS) \
+    stop_events_(EVENTS, __PRETTY_FUNCTION__)
+    void stop_events_(int events, const char* caller_name)
+#endif
     {
         if (conn_watcher.events & events == 0)
             return;
@@ -99,9 +112,9 @@ public:
 
         if (conn_watcher.events) {
             ev_io_start(event_loop, &conn_watcher);
-            debug("stopped events: ", events, "; running: ", conn_watcher.events);
+            debug("stopped events: ", events, "; running: ", conn_watcher.events, " [", caller_name, "]");
         } else {
-            debug("stopped events: ", events, "; no events running");
+            debug("stopped events: ", events, "; no events running [", caller_name, "]");
         }
     }
 
