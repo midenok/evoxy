@@ -1,2 +1,2 @@
-# udtproxy
-HTTP proxy via UDT tunnel
+# Evoxy
+libev-based HTTP proxy
