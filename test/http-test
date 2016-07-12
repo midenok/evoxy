@@ -24,13 +24,20 @@ my %CONFIG = (
     check_response => 1
 );
 
-my %TESTS = (
+our @TESTS = (
     simple => 'Simple GET',
     raw => 'Raw GET, sent by small portions',
     raw_chunked => 'Raw POST with small chunked body',
-    post_file => 'Send small file in POST body',
-    post_chunked => 'Send large file in chunked POST body'
+    post_file => 'Send file in POST body',
+    get_file => 'Send file in response body',
+    post_chunked => 'Send large file in chunked POST body',
+    all => 'Run all tests one by one'
 );
+
+my %TESTS = @TESTS;
+for (my $i = $#TESTS; $i > 0; $i -= 2) {
+    splice @TESTS, $i, 1;
+}
 
 my %OPTIONS = (
     # Format:
@@ -200,18 +207,17 @@ sub process_options
     if (not exists $TESTS{$c->{test}}) {
         die "No such test: $c->{test}\n";
     }
-
-    my $class = "Test::". join '', map { ucfirst } split('_', $c->{test});
-    $c->{test_class} = $class;
-    if ($class->can('process_options')) {
-        $class->process_options($c);
-    }
 }
 
 sub new_test
 {
     my $c = shift;
-    return $c->{test_class}->new();
+    my $test = shift;
+    my $class = "Test::". join '', map { ucfirst } split('_', ${test});
+    if ($class->can('process_options')) {
+        $class->process_options($c);
+    }
+    return $class->new();
 }
 
 sub run_condition
@@ -575,10 +581,12 @@ my $DaemonFD :shared;
 my ($WakerR, $WakerW);
 my $WakerFD :shared;
 
-sub start
+my $d;
+
+sub init
 {
     my $c = Config::get();
-    my $d = HTTP::Daemon->new(
+    $d = HTTP::Daemon->new(
         LocalAddr => $c->{'listen_ip'},
         LocalPort => $c->{'listen_port'},
         ReuseAddr => 1
@@ -588,6 +596,11 @@ sub start
     %Daemon = %${\*$d};
     $DaemonFD = fileno($d);
     open my $fh, "+<&=$DaemonFD" or die "open: $!";
+}
+
+sub start
+{
+    my $c = Config::get();
 
     pipe $WakerR, $WakerW
         or die "pipe: $!";
@@ -605,7 +618,6 @@ sub get_daemon
     return $d;
 }
 
-my @Requests :shared;
 my %ResponsesSent :shared;
 
 my $WorkerThreads :shared;
@@ -617,7 +629,6 @@ sub worker_thread
     ++$WorkerThreads;}
     my $d = get_daemon();
     my $c = Config::get();
-    my $test = $c->new_test;
 
     loop:
     while ($RunS) {
@@ -635,25 +646,26 @@ sub worker_thread
             }
             $c->verbose("S: got request ${id}\n");
 
-            $test->{id} = $id;
+            my $test = Tests::get_test($id);
             $conn->get_body($req, $test)
                 or Threads::die "Server failed to parse body!\n";
 
-            my $req_frozen = freeze [$req, $id];
-            {
-                lock @Requests;
-                push @Requests, $req_frozen;
-                cond_signal @Requests;
+            if ($c->{check_request}) {
+                my $sent = Client::get_request($id)
+                    or Threads::die "Can't get request ${id} from Client!";
+                $test->check_request($sent, $req);
             }
 
             my ($ok, $resp) = $test->send_response($id, $conn);
             Threads::die "$!" unless $ok;
 
             if ($c->{check_response}) {
+                if (ref $resp->{_content}) {
+                    $resp->{_content} = "";
+                }
                 $resp = freeze $resp;
                 lock %ResponsesSent;
                 $ResponsesSent{$id} = $resp;
-                cond_signal %ResponsesSent;
             }
         } # while ($conn->get_request())
         # FIXME: check errno
@@ -670,7 +682,8 @@ use Time::HiRes 'usleep';
 sub stop
 {
     $RunS = 0;
-    shutdown(get_daemon(), 2);
+
+    shutdown($d, 2);
     while ($WorkerThreads) {
         # NB:  doesn't read from pipe!
         # How this will behave on multiple threads?
@@ -682,50 +695,17 @@ sub stop
     close $WakerR;
 }
 
-sub get_request
-{
-    my $run = shift;
-    my $req;
-    my $id;
-    my $frozen;
-    {
-        lock @Requests;
-        cond_wait @Requests
-            until @Requests || !$$run;
-        return unless $$run;
-        $frozen = shift @Requests;
-    }
-    ($req, $id) = @{thaw $frozen};
-    return ($req, $id);
-}
-
 sub get_response
 {
-    my $run = shift;
     my $id = shift;
     my $resp;
     {
         lock %ResponsesSent;
-        cond_wait %ResponsesSent
-            until exists $ResponsesSent{$id} || !$$run;
-        return unless $$run;
         $resp = $ResponsesSent{$id};
         delete $ResponsesSent{$id};
     }
     $resp = thaw $resp;
     return $resp;
-}
-
-sub broadcast
-{
-    {
-        lock @Requests;
-        cond_broadcast @Requests;
-    }
-    {
-        lock %ResponsesSent;
-        cond_broadcast %ResponsesSent;
-    }
 }
 
 =pod
@@ -752,8 +732,6 @@ my @CQueue :shared;
 my $CQFreed :shared;
 my %ReqSent :shared;
 
-my @Resps :shared;
-
 sub start
 {
     $RunC = 1;
@@ -771,17 +749,17 @@ sub push_req_sent
     {
         lock %ReqSent;
         $ReqSent{$id} = $frozen;
-        cond_signal %ReqSent;
     }
     return undef;
 }
+
+use constant REQUEST_DONE => 1;
 
 sub client_thread
 {
     {lock $ClientThreads;
     ++$ClientThreads;}
     my $c = Config::get();
-    my $test = $c->new_test->send_init;
 
     loop:
     while ($RunC) {
@@ -798,17 +776,18 @@ sub client_thread
             }
         }
 
+        my $test = Tests::get_test($id);
+        $test->send_init;
         my $resp = $test->send_request($id);
-
+        Threads::die "$!" if $!;
         $resp->request(undef); # TODO: actually we don't need %ReqSent since we can pass req in resp
 
-        Threads::die "$!" if $!;
-        my $frozen = freeze [ $resp, $id ];
-        {
-            lock @Resps;
-            push @Resps, $frozen;
-            cond_signal @Resps;
+        if ($c->{check_response}) {
+            my $sent = Server::get_response($id)
+                or next;
+            $test->check_response($sent, $resp);
         }
+        Tests::checkpoint($id, REQUEST_DONE);
     }
     {lock $ClientThreads;
     --$ClientThreads;}
@@ -846,50 +825,15 @@ sub clear_queue
 
 sub get_request
 {
-    my $run = shift;
     my $id = shift;
     my $req_sent;
     {
         lock %ReqSent;
-        until (exists $ReqSent{$id} || !$$run) {
-            cond_wait %ReqSent;
-        }
-        return unless $$run;
         $req_sent = $ReqSent{$id};
         delete $ReqSent{$id};
     }
     $req_sent = thaw $req_sent;
     return $req_sent;
-}
-
-sub get_response
-{
-    my $run = shift;
-    my $resp;
-    my $id;
-    my $frozen;
-    {
-        lock @Resps;
-        until (@Resps || !$$run) {
-            cond_wait @Resps;
-        }
-        return unless $$run;
-        $frozen = shift @Resps;
-    }
-    ($resp, $id) = @{thaw $frozen};
-    return ($resp, $id);
-}
-
-sub broadcast
-{
-    {
-        lock %ReqSent;
-        cond_broadcast %ReqSent;
-    }
-    {
-        lock @Resps;
-        cond_broadcast @Resps;
-    }
 }
 
 1;
@@ -942,7 +886,7 @@ sub print
         use integer;
         $reqs_per_sec /= 1;
     }
-    Config::get->print("Finished in $elpsd secs\n", "$reqs_per_sec requests/sec\n");
+    Config::get->print("Finished in $elpsd secs; $reqs_per_sec requests/sec\n");
 }
 
 sub run_time
@@ -968,32 +912,22 @@ my $ReqId = 0;
 my $ReqDone :shared;
 $ReqDone = 0;
 my %Tests :shared;
-my $RunT :shared;
 
 my $Watch = Stopwatch->new();
 
-sub start
-{
-    $RunT = 1;
-    my $c = Config::get();
-    if ($c->{check_request}) {
-        Threads::start(1, \&request_checker_thread);
-    }
-    Threads::start(1, \&response_checker_thread);
-}
-
 sub run
-{   
+{
+    my $test = shift;
     my $c = Config::get();
 
-    $c->print("Test: $c->{test}, started...\n");
+    $c->print("Test: ${test}, started...\n");
 
     $Watch->start;
 
     for (my $n = 0; $c->run_condition($n, $Watch); ++$n) {
         {
             lock %Tests;
-            $Tests{$ReqId} = $c->{check_request} ? 2 : 1;
+            $Tests{$ReqId} = $test;
         }
 
         # client queue will block until less than MAX_REQS
@@ -1020,96 +954,30 @@ sub wait
     $Watch->print($ReqDone);
 }
 
-my $CheckerThreads :shared;
-$CheckerThreads = 0;
-
-sub request_checker_thread
+sub checkpoint
 {
-    {lock $CheckerThreads;
-    $CheckerThreads++;}
-
-    my $c = Config::get();
-    my $t = $c->new_test;
-    my $can_check = $t->can('check_request');
-
-    while ($RunT) {
-        my ($req, $id) = Server::get_request(\$RunT)
-            or next;
-        my $sent = Client::get_request(\$RunT, $id)
-            or next;
-        if ($can_check) {
-            $t->check_request($sent, $req);
-        } else {
-            check_message($sent, $req);
-        }
-        {
-            lock %Tests;
-            if (0 == --$Tests{$id}) {
-                delete $Tests{$id};
-                cond_signal %Tests;
-            }
-        }
+    my $id = shift;
+    my $done = shift;
+    if ($done) {
+        ++$ReqDone;
+        lock %Tests;
+        delete $Tests{$id};
+        cond_signal %Tests;
     }
-    {lock $CheckerThreads;
-    $CheckerThreads--;}
 }
 
-sub response_checker_thread
+sub get_test
 {
-    {lock $CheckerThreads;
-    $CheckerThreads++;}
-
-    my $c = Config::get();
-    my $t = $c->new_test;
-    my $can_check = $t->can('check_response');
-
-    loop:
-    while ($RunT) {
-        my ($resp, $id) = Client::get_response(\$RunT)
-            or next;
-
-        if ($resp->code ne RC_OK) {
-            $c->print("Unexpected response: ". $resp->message. " (". $resp->code. ")\n");
-            lock %Tests;
-            %Tests = ();
-            cond_signal %Tests;
-            last loop;
-        }
-
-        if ($c->{check_response}) {
-            my $sent = Server::get_response(\$RunT, $id)
-                or next;
-            if ($can_check) {
-                $t->check_response($sent, $resp);
-            } else {
-                check_message($sent, $resp);
-            }
-        }
-        {
-            lock %Tests;
-            if (0 == --$Tests{$id}) {
-                delete $Tests{$id};
-                cond_signal %Tests;
-            }
-        }
-        ++$ReqDone;
-    }
-    {lock $CheckerThreads;
-    $CheckerThreads--;}
+    my $id = shift;
+    my $test = $Tests{$id};
+    die "No test for req ${id}" unless $test;
+    my $c = Config::get;
+    my $t = $c->new_test($test);
+    $t->{id} = $id;
+    return $t;
 }
 
 use Time::HiRes 'usleep';
-
-sub stop
-{
-    $RunT = 0;
-    while ($CheckerThreads) {
-        Server::broadcast();
-        Client::broadcast();
-    } continue {
-        usleep 1;
-    }
-}
 
 my %ignored = (
     'transfer-encoding' => 1,
@@ -1231,6 +1099,27 @@ sub build_response
         ],
         $body
     );
+}
+
+sub check_request
+{
+    my $self = shift;
+    my $sent = shift;
+    my $req = shift;
+
+    Tests::check_message($sent, $req);
+}
+
+sub check_response
+{
+    my $self = shift;
+    my $sent = shift;
+    my $resp = shift;
+
+    if ($resp->code ne RC_OK) {
+        Threads::die "Unexpected response: ". $resp->message. " (". $resp->code. ")\n";
+    }
+    Tests::check_message($sent, $resp);
 }
 
 1;
@@ -1426,6 +1315,70 @@ sub chunks_done
 
 1;
 
+package Test::GetFile;
+use base 'Test::Simple';
+
+use HTTP::Response;
+use HTTP::Status;
+
+sub process_options
+{
+    my $class = shift;
+    my $c = shift;
+    die "get_file requires valid --file option!\n"
+        unless $c->{file} && -f $c->{file};
+}
+
+sub build_response
+{
+    my $self = shift;
+    my $request_id = shift;
+    my $c = Config::get();
+
+    open my $fh, "<", $c->{file}
+        or Threads::die "$!";
+
+    $self->{fh} = $fh;
+
+    return HTTP::Response->new(
+        RC_OK,
+        undef,
+        [
+            'X-Request-Id' => $request_id,
+            Content_Type => 'application/octet-stream'
+        ],
+        sub {
+            return $self->next_chunk();
+        }
+    );
+}
+
+sub next_chunk
+{
+    my $self = shift;
+    my $fh = $self->{fh};
+
+    my ($len, $buf);
+    $len = sysread $fh, $buf, 4096;
+    if ($len < 0) {
+        Threads::die "sysread: $!";
+    }
+    if ($len > 0) {
+        return $buf;
+    }
+    close $fh;
+    return undef;
+}
+
+sub check_response
+{
+    my $self = shift;
+    my $sent = shift;
+    my $got = shift;
+}
+
+1;
+
 package Test::PostChunked;
 use base 'Test::PostFile';
 
@@ -1490,6 +1443,8 @@ sub send_request
                 cond_signal $SendBufR;
             }
         }
+
+        close $fh;
         $ua->write_chunk_eof() or
             Threads::die "write_chunk_eof() failed!";
     }
@@ -1540,15 +1495,28 @@ sub chunk
 1;
 
 package main;
+use Config;
 
+my $c = Config::get();
+
+my @tests;
+if ($c->{test} eq 'all') {
+    push @tests, grep {
+        $_ ne 'all'
+    } @Config::TESTS;
+} else {
+    push @tests, $c->{test};
+}
+
+Server::init();
 Server::start();
 Client::start();
-Tests::start();
 
-Tests::run();
-Tests::wait();
+for my $t (@tests) {
+    Tests::run($t);
+    Tests::wait();
+}
 
-Tests::stop();
 Client::stop();
 Server::stop();
 
