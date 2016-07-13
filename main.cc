@@ -1,6 +1,6 @@
 #include <iostream>
 #include <cstdio>
-#include "udtproxy.h"
+#include "evoxy.h"
 
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -168,7 +168,7 @@ daemonize()
 int
 main(int argc, char ** argv)
 {
-    int res = optionProcess(&udtproxyOptions, argc, argv);
+    int res = optionProcess(&evoxyOptions, argc, argv);
     res = ferror(stdout);
     if (res != 0) {
         cerror("optionProcess", "output error writing to stdout!");

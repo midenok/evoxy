@@ -1,6 +1,6 @@
 AutoGen Definitions options;
-prog-name     = udtproxy;
-prog-title    = "UDT Proxy: HTTP via UDT tunnel";
+prog-name     = evoxy;
+prog-title    = "Evoxy: libev-based HTTP proxy";
 long-opts;
 gnu-usage;    /* GNU style preferred to default */
 

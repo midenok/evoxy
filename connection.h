@@ -167,6 +167,7 @@ public:
         event_loop { event_loop_ }
     {
         debug("OnEventLoop created");
+        conn_watcher.fd = 0;
         ev_async_init(&async_watcher, async_callback);
         async_watcher.data = this;
     }

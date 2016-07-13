@@ -1,12 +1,12 @@
 cmake_minimum_required(VERSION 3.2)
 
 include_directories(${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
-add_executable(udtproxy main.cc http.cc connection.cc udtproxy.c threads.cc)
-target_link_libraries(udtproxy -lopts -lpthread -lev)
+add_executable(evoxy main.cc http.cc connection.cc evoxy.c threads.cc)
+target_link_libraries(evoxy -lopts -lpthread -lev)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=gnu++11" )
 
-add_custom_command(OUTPUT udtproxy.c udtproxy.h COMMAND autogen ${CMAKE_CURRENT_SOURCE_DIR}/udtproxy.def MAIN_DEPENDENCY udtproxy.def)
+add_custom_command(OUTPUT evoxy.c evoxy.h COMMAND autogen ${CMAKE_CURRENT_SOURCE_DIR}/evoxy.def MAIN_DEPENDENCY evoxy.def)
 # use `autoopts-config ldflags` instead of -lopts
 
 ## Crutches ##
