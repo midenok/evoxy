@@ -5,6 +5,7 @@ use threads;
 use threads::shared;
 
 use Getopt::Long qw(:config bundling);
+use Storable qw[freeze thaw];
 use Pod::Usage;
 use Data::Dumper;
 
@@ -35,15 +36,20 @@ our @TESTS = (
 );
 
 my %TESTS = @TESTS;
+
 for (my $i = $#TESTS; $i > 0; $i -= 2) {
     splice @TESTS, $i, 1;
 }
 
+@TESTS = grep {
+    $_ ne 'all'
+} @TESTS;
+
 my %OPTIONS = (
     # Format:
     # name          => ['aliases', 'type', 'description', 'dashed_variant'(generated)]
-    test            => ['t', '=s', 'Test type to run'],
-    list            => ['l', '', 'List test types'],
+    test            => ['t', '=s', 'Comma-separated list of tests to run (see --list)'],
+    list            => ['l', '', 'List all tests'],
     server_address  => ['s', '=s', 'Bind HTTP server to specified IP:PORT'],
     proxy_address   => ['p', '=s', 'IP:PORT of tested HTTP proxy'],
     connect_address => ['c', '=s', 'Address to connect client to; defaults to --server-address'],
@@ -204,9 +210,20 @@ sub process_options
     }
     delete $c->{max_requests_default};
 
-    if (not exists $TESTS{$c->{test}}) {
-        die "No such test: $c->{test}\n";
+    my @tests = split(',', $c->{test});
+    my @test_list;
+    for my $test (@tests) {
+        if (not exists $TESTS{$test}) {
+            die "No such test: $test\n";
+        }
+        push @test_list, $test eq 'all' ? @TESTS : $test;
     }
+    $c->{tests} = freeze \@test_list;
+}
+
+sub tests
+{
+    @{thaw $_[0]->{tests}};
 }
 
 sub new_test
@@ -225,7 +242,10 @@ sub run_condition
     my $c = shift;
     my $requests = shift;
     my $watch = shift;
-
+    
+    if ($c->{stop}) {
+        return 0;
+    }
     if ($c->{max_requests} && $requests >= $c->{max_requests}) {
         return 0;
     }
@@ -236,11 +256,18 @@ sub run_condition
     return 1;
 }
 
+sub stop_tests
+{
+    my $c = shift;
+    $c->{stop} = 1;
+    $c->{time_up} = 1;
+}
+
 sub print
 {
     my $c = shift;
     unless ($c->{quiet}) {
-        print @_;
+        print @_, "\n";
     }
 }
 
@@ -248,7 +275,7 @@ sub verbose
 {
     my $c = shift;
     if ($c->{verbose}) {
-        print @_;
+        print @_, "\n";
     }
 }
 
@@ -591,7 +618,7 @@ sub init
         LocalPort => $c->{'listen_port'},
         ReuseAddr => 1
     ) or die $c->{server_address}. ": $!\n";
-    $c->print("Started HTTP server at " . $d->url . "\n");
+    $c->print("Started HTTP server at " . $d->url);
 
     %Daemon = %${\*$d};
     $DaemonFD = fileno($d);
@@ -641,10 +668,10 @@ sub worker_thread
         while ($req = $conn->get_headers($WakerFD)) {
             my $id = $req->header('X-Request-Id');
             unless (defined $id) {
-                $c->verbose("S: no X-Request-Id!\n");
+                $c->verbose("S: no X-Request-Id!");
                 last;
             }
-            $c->verbose("S: got request ${id}\n");
+            $c->verbose("S: got request ${id}");
 
             my $test = Tests::get_test($id);
             $conn->get_body($req, $test)
@@ -653,9 +680,16 @@ sub worker_thread
             if ($c->{check_request}) {
                 my $sent = Client::get_request($id)
                     or Threads::die "Can't get request ${id} from Client!";
-                $test->check_request($sent, $req);
+                unless ($test->check_request($sent, $req)) {
+                    $c->error("S: request $id check failed!");
+                    $RunS = 0;
+                    $c->stop_tests();
+                    last loop;
+                }
+                $c->verbose("S: request $id check success!");
             }
-
+            
+            $c->verbose("S: sending response $id");
             my ($ok, $resp) = $test->send_response($id, $conn);
             Threads::die "$!" unless $ok;
 
@@ -778,14 +812,23 @@ sub client_thread
 
         my $test = Tests::get_test($id);
         $test->send_init;
+        $c->verbose("C: sending request $id");
         my $resp = $test->send_request($id);
         Threads::die "$!" if $!;
+        $c->verbose("C: got response $id");
         $resp->request(undef); # TODO: actually we don't need %ReqSent since we can pass req in resp
 
         if ($c->{check_response}) {
             my $sent = Server::get_response($id)
                 or next;
-            $test->check_response($sent, $resp);
+
+            unless ($test->check_response($sent, $resp)) {
+                $c->error("C: response $id check failed!");
+                $RunC = 0;
+                $c->stop_tests();
+                last loop;
+            }
+            $c->verbose("C: response $id check success!");
         }
         Tests::checkpoint($id, REQUEST_DONE);
     }
@@ -886,7 +929,7 @@ sub print
         use integer;
         $reqs_per_sec /= 1;
     }
-    Config::get->print("Finished in $elpsd secs; $reqs_per_sec requests/sec\n");
+    Config::get->print("Finished in $elpsd secs; $reqs_per_sec requests/sec");
 }
 
 sub run_time
@@ -910,7 +953,9 @@ use Storable qw[freeze thaw];
 
 my $ReqId = 0;
 my $ReqDone :shared;
+my $ReqTotal :shared;
 $ReqDone = 0;
+$ReqTotal = 0;
 my %Tests :shared;
 
 my $Watch = Stopwatch->new();
@@ -920,8 +965,8 @@ sub run
     my $test = shift;
     my $c = Config::get();
 
-    $c->print("Test: ${test}, started...\n");
-
+    $c->print("Test: ${test}, started...");
+    $ReqDone = 0;
     $Watch->start;
 
     for (my $n = 0; $c->run_condition($n, $Watch); ++$n) {
@@ -944,6 +989,12 @@ sub run
     }
 }
 
+sub print_total
+{
+    my $c = Config::get;
+    $c->print("Finished total of $ReqTotal requests");
+}
+
 sub wait
 {
     lock %Tests;
@@ -960,6 +1011,7 @@ sub checkpoint
     my $done = shift;
     if ($done) {
         ++$ReqDone;
+        ++$ReqTotal;
         lock %Tests;
         delete $Tests{$id};
         cond_signal %Tests;
@@ -990,17 +1042,20 @@ sub check_message
     my $got = shift;
 
     my $type = ref $sent eq 'HTTP::Request' ? 'request' : 'response';
+    my $c = Config::get;
 
     for my $name ($sent->header_field_names) {
         next if $ignored{lc $name};
         my $val = $got->header($name);
         if (not defined $val) {
-            Threads::die "Received ${type} lacks header ${name}!\n";
+            $c->error("Received ${type} lacks header ${name}!");
+            return 0;
         }
         my $expected = $sent->header($name);
         $expected =~ s/[\r\n\t ]+/ /gm; # multi-line headers are catenated in HTTP::Daemon
         if ($val ne $expected) {
-            Threads::die "Wrong ${type} header ${name}: ${val}, expected ${expected}\n";
+            $c->error("Wrong ${type} header ${name}: ${val}, expected ${expected}");
+            return 0;
         }
     }
     my $sent_content = $sent->content;
@@ -1008,11 +1063,14 @@ sub check_message
     my $sent_len = length $sent_content;
     my $got_len = length $got_content;
     if ($sent_len != $got_len) {
-        Threads::die "Wrong ${type} body size: ${got_len}, expected ${sent_len}\n";
+        $c->error("Wrong ${type} body size: ${got_len}, expected ${sent_len}");
+        return 0;
     }
     if ($sent_content ne $got_content) {
-        Threads::die "Wrong ${type} body content!\n";
+        $c->error("Wrong ${type} body content!");
+        return 0;
     }
+    return 1;
 }
 
 1;
@@ -1107,7 +1165,7 @@ sub check_request
     my $sent = shift;
     my $req = shift;
 
-    Tests::check_message($sent, $req);
+    return Tests::check_message($sent, $req);
 }
 
 sub check_response
@@ -1115,11 +1173,14 @@ sub check_response
     my $self = shift;
     my $sent = shift;
     my $resp = shift;
+    
+    my $c = Config::get;
 
     if ($resp->code ne RC_OK) {
-        Threads::die "Unexpected response: ". $resp->message. " (". $resp->code. ")\n";
+        $c->error("Unexpected response: ". $resp->message. " (". $resp->code. ")");
+        return 0;
     }
-    Tests::check_message($sent, $resp);
+    return Tests::check_message($sent, $resp);
 }
 
 1;
@@ -1499,23 +1560,19 @@ use Config;
 
 my $c = Config::get();
 
-my @tests;
-if ($c->{test} eq 'all') {
-    push @tests, grep {
-        $_ ne 'all'
-    } @Config::TESTS;
-} else {
-    push @tests, $c->{test};
-}
-
 Server::init();
 Server::start();
 Client::start();
 
-for my $t (@tests) {
-    Tests::run($t);
+for my $test ($c->tests) {
+    Tests::run($test);
     Tests::wait();
+    if ($c->{stop}) {
+        last;
+    }
 }
+
+Tests::print_total();
 
 Client::stop();
 Server::stop();
