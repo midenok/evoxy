@@ -41,6 +41,7 @@ private:
         if (conn_watcher.fd) {
             debug("terminating connection");
             ev_io_stop(event_loop, &conn_watcher);
+            // No matter if it's not connected, ENOTCONN is not fatal
             shutdown(conn_watcher.fd, SHUT_RDWR);
             close(conn_watcher.fd);
             conn_watcher.fd = 0;
