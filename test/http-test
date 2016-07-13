@@ -60,6 +60,7 @@ my %OPTIONS = (
     client_threads  => ['C', '=i', "Number of client threads to spawn"],
     max_requests    => ['n', '=i', "Number of requests to send"],
     max_time        => ['T', '=i', "Maximum time in seconds to run tests"],
+    stop_timeout    => ['st', '=i', "Maximum time used to stop Tests, Client or Server"],
     check_request   => ['chreq', '!', "Compare requests sent by client and received by server"],
     check_response  => ['chresp', '!', "Compare responses sent by server and received by client"],
     no_check        => ['nochk', '', "Same as: --no-check-request --no-check-response"],
@@ -243,7 +244,7 @@ sub run_condition
     my $c = shift;
     my $requests = shift;
     my $watch = shift;
-    
+
     if ($c->{force_stop}) {
         return 0;
     }
@@ -688,7 +689,7 @@ sub worker_thread
                 }
                 $c->verbose("S: request $id check success!");
             }
-            
+
             $c->verbose("S: sending response $id");
             my ($ok, $resp) = $test->send_response($id, $conn);
             Threads::die "$!" unless $ok;
@@ -727,7 +728,7 @@ sub stop
         $WakerW->flush;
     } continue {
         my $elapsed = tv_interval($start, [gettimeofday]);
-        if ($elapsed > $timeout) {
+        if ($timeout && $elapsed > $timeout) {
             Threads::die "Can't stop Server: $WorkerThreads threads remaining!\n";
         }
         usleep 1;
@@ -854,7 +855,7 @@ sub stop
         cond_signal @CQueue;
     } continue {
         my $elapsed = tv_interval($start, [gettimeofday]);
-        if ($elapsed > $timeout) {
+        if ($timeout && $elapsed > $timeout) {
             Threads::die "Can't stop Client: $ClientThreads threads remaining!\n";
         }
         usleep 1;
@@ -943,7 +944,7 @@ sub print
         use integer;
         $reqs_per_sec /= 1;
     }
-    Config::get->print("Finished in $elpsd secs; $reqs_per_sec requests/sec");
+    Config::get->print("      finished in $elpsd secs; $reqs_per_sec requests/sec");
 }
 
 sub run_time
@@ -1021,15 +1022,21 @@ sub print_total
 sub wait
 {
     my $c = Config::get;
-    my $timeout = time + $c->{stop_timeout} + 1;
+    if ($c->{stop_timeout}) {
+        my $timeout = time + $c->{stop_timeout} + 1;
+        my $ok = 1;
 
-    lock %Tests;
-    my $ok = 1;
-    $ok = cond_timedwait %Tests, $timeout
-        while (%Tests && $ok);
+        lock %Tests;
+        $ok = cond_timedwait %Tests, $timeout
+            while (%Tests && $ok);
 
-    unless ($ok) {
-        Threads::die "Can't finish Tests: timeout reached!\n";
+        unless ($ok) {
+            Threads::die "Can't finish Tests: timeout reached!\n";
+        }
+    } else {
+        lock %Tests;
+        cond_wait %Tests
+            while %Tests;
     }
 
     $Watch->stop;
@@ -1071,6 +1078,7 @@ sub check_message
 {
     my $sent = shift;
     my $got = shift;
+    my $no_content = shift;
 
     my $type = ref $sent eq 'HTTP::Request' ? 'request' : 'response';
     my $c = Config::get;
@@ -1088,6 +1096,9 @@ sub check_message
             $c->error("Wrong ${type} header ${name}: ${val}, expected ${expected}");
             return 0;
         }
+    }
+    if ($no_content) {
+        return 1;
     }
     my $sent_content = $sent->content;
     my $got_content = $got->content;
@@ -1204,7 +1215,7 @@ sub check_response
     my $self = shift;
     my $sent = shift;
     my $resp = shift;
-    
+
     my $c = Config::get;
 
     if ($resp->code ne RC_OK) {
@@ -1462,11 +1473,36 @@ sub next_chunk
     return undef;
 }
 
+use constant NO_CONTENT => 1;
+
 sub check_response
 {
     my $self = shift;
     my $sent = shift;
     my $got = shift;
+    my $c = Config::get;
+    Tests::check_message($sent, $got, NO_CONTENT);
+
+    open my $fh, "<", $c->{file}
+        or Threads::die "$!";
+
+    my $content = $got->content;
+    my ($len, $buf);
+    my $pos = 0;
+    while ($len = sysread $fh, $buf, 4096) {
+        if ($len < 0) {
+            Threads::die "sysread: $!";
+        }
+    } continue {
+        if ($buf ne substr $content, $pos, $len) {
+            $c->error("Wrong response body: chunk at ${pos} of ${len} bytes don't match!");
+            close $fh;
+            return 0;
+        }
+        $pos += $len;
+    };
+    close $fh;
+    return 1;
 }
 
 1;
