@@ -22,7 +22,8 @@ my %CONFIG = (
     max_requests_default => 1,
     max_time  => 0,
     check_request => 1,
-    check_response => 1
+    check_response => 1,
+    stop_timeout => 3 # secs
 );
 
 our @TESTS = (
@@ -243,7 +244,7 @@ sub run_condition
     my $requests = shift;
     my $watch = shift;
     
-    if ($c->{stop}) {
+    if ($c->{force_stop}) {
         return 0;
     }
     if ($c->{max_requests} && $requests >= $c->{max_requests}) {
@@ -254,13 +255,6 @@ sub run_condition
         return 0;
     }
     return 1;
-}
-
-sub stop_tests
-{
-    my $c = shift;
-    $c->{stop} = 1;
-    $c->{time_up} = 1;
 }
 
 sub print
@@ -277,6 +271,12 @@ sub verbose
     if ($c->{verbose}) {
         print @_, "\n";
     }
+}
+
+sub error
+{
+    my $c = shift;
+    print STDERR @_, "\n";
 }
 
 1;
@@ -683,7 +683,7 @@ sub worker_thread
                 unless ($test->check_request($sent, $req)) {
                     $c->error("S: request $id check failed!");
                     $RunS = 0;
-                    $c->stop_tests();
+                    Tests::stop();
                     last loop;
                 }
                 $c->verbose("S: request $id check success!");
@@ -711,11 +711,13 @@ sub worker_thread
     --$WorkerThreads;}
 }
 
-use Time::HiRes 'usleep';
+use Time::HiRes qw[usleep gettimeofday tv_interval];
 
 sub stop
 {
     $RunS = 0;
+    my $start = [gettimeofday];
+    my $timeout = Config::get->{stop_timeout};
 
     shutdown($d, 2);
     while ($WorkerThreads) {
@@ -723,6 +725,11 @@ sub stop
         # How this will behave on multiple threads?
         print $WakerW "1";
         $WakerW->flush;
+    } continue {
+        my $elapsed = tv_interval($start, [gettimeofday]);
+        if ($elapsed > $timeout) {
+            Threads::die "Can't stop Server: $WorkerThreads threads remaining!\n";
+        }
         usleep 1;
     }
     close $WakerW;
@@ -753,7 +760,7 @@ sub get_response
 package Client;
 use strict;
 use LWP  5.825;
-use Time::HiRes 'usleep';
+use Time::HiRes qw[usleep gettimeofday tv_interval];
 
 use threads;
 use threads::shared;
@@ -825,7 +832,7 @@ sub client_thread
             unless ($test->check_response($sent, $resp)) {
                 $c->error("C: response $id check failed!");
                 $RunC = 0;
-                $c->stop_tests();
+                Tests::stop();
                 last loop;
             }
             $c->verbose("C: response $id check success!");
@@ -839,10 +846,17 @@ sub client_thread
 sub stop
 {
     $RunC = 0;
+    my $start = [gettimeofday];
+    my $timeout = Config::get->{stop_timeout};
+
     while ($ClientThreads) {
         lock @CQueue;
         cond_signal @CQueue;
     } continue {
+        my $elapsed = tv_interval($start, [gettimeofday]);
+        if ($elapsed > $timeout) {
+            Threads::die "Can't stop Client: $ClientThreads threads remaining!\n";
+        }
         usleep 1;
     }
 }
@@ -989,6 +1003,15 @@ sub run
     }
 }
 
+sub stop
+{
+    my $c = Config::get;
+    $c->{force_stop} = 1;
+    lock %Tests;
+    %Tests = ();
+    cond_signal %Tests;
+}
+
 sub print_total
 {
     my $c = Config::get;
@@ -997,9 +1020,17 @@ sub print_total
 
 sub wait
 {
+    my $c = Config::get;
+    my $timeout = time + $c->{stop_timeout} + 1;
+
     lock %Tests;
-    cond_wait %Tests
-        while %Tests;
+    my $ok = 1;
+    $ok = cond_timedwait %Tests, $timeout
+        while (%Tests && $ok);
+
+    unless ($ok) {
+        Threads::die "Can't finish Tests: timeout reached!\n";
+    }
 
     $Watch->stop;
     $Watch->print($ReqDone);
