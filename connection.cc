@@ -94,7 +94,18 @@ Proxy::Frontend::read_callback()
                 proxy.release();
                 return true;
             }
-            debug("F: got request to ", parser.host, ", URI: ", parser.request_uri);
+        #ifndef NDEBUG
+            {
+                char cl[20] = "unset";
+                if (parser.content_length != HTTPParser::cl_unset)
+                    snprintf(cl, sizeof(cl), "%d", parser.content_length);
+
+                debug("F: got request to ", parser.host, ", URI: ", parser.request_uri,
+                    " (cl: ", cl,
+                    ", chunked: ", parser.chunked,
+                    ", force_close: ", parser.force_close, ")");
+            }
+        #endif
 
             progress =
                 parser.content_length == 0 ||
@@ -293,9 +304,9 @@ Proxy::Backend::write_callback()
             if (progress == REQUEST_FINISHED) {
                 // maybe do this in read_callback() ?
                 buffer.reset();
-                start_only_events(EV_READ);
                 progress = RESPONSE_STARTED;
                 debug("B: changed progress: ", progress);
+                start_only_events(EV_READ);
                 parser.start_response();
             } else {
                 spurious_writes++;

@@ -41,6 +41,7 @@ private:
         if (conn_watcher.fd) {
             debug("terminating connection");
             ev_io_stop(event_loop, &conn_watcher);
+            shutdown(conn_watcher.fd, SHUT_RDWR);
             close(conn_watcher.fd);
             conn_watcher.fd = 0;
         }

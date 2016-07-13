@@ -53,8 +53,8 @@ struct ResponseHeader
 {
     enum Id
     {
-        CONTENT_LENGTH = 0,
-        CONNECTION,
+        CONNECTION = 0,
+        CONTENT_LENGTH,
         TRANSFER_ENCODING,
         unknown /* must be the last element */
     };
