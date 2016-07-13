@@ -19,6 +19,7 @@ struct RequestHeader
     enum Id
     {
         CACHE_CONTROL = 0,
+        CONNECTION,
         CONTENT_LENGTH,
         HOST,
         TRANSFER_ENCODING,
@@ -82,6 +83,7 @@ private:
 const char * RequestHeader::_names[] = {
 /* must be in order of enum! */
     "cache-control",
+    "connection",
     "content-length",
     "host",
     "transfer-encoding",
@@ -259,6 +261,21 @@ bool HTTPParser::next_line()
     return false;
 }
 
+inline
+void
+HTTPParser::parse_http_version(unsigned &version)
+{
+    size_t sep = http_version.find('.');
+    if (sep != buffer::string::npos) {
+        buffer::string major, minor;
+        major.assign(http_version.begin(), &http_version[sep]);
+        minor.assign(&http_version[sep + 1], http_version.end());
+        version = buffer::stol(major) * 1000 + buffer::stol(minor);
+    } else {
+        version = buffer::stol(http_version) * 1000;
+    }
+}
+
 HTTPParser::Status
 HTTPParser::parse_request_line()
 {
@@ -303,6 +320,10 @@ HTTPParser::parse_request_line()
     }
 
     http_version.assign(&found_line[sep], found_line.end() - CRLF.size());
+    parse_http_version(request_version);
+    if (request_version <= 1000) {
+        force_close = true;
+    }
 
     parse_line = &HTTPParser::parse_request_head;
 
@@ -334,17 +355,9 @@ HTTPParser::Status HTTPParser::parse_response_line()
     }
 
     http_version.assign(&found_line[sep], &found_line[sp1]);
-    sep = http_version.find('.');
-    if (sep != buffer::string::npos) {
-        buffer::string major, minor;
-        major.assign(http_version.begin(), &http_version[sep]);
-        minor.assign(&http_version[sep + 1], http_version.end());
-        version = buffer::stol(major) * 1000 + buffer::stol(minor);
-    } else {
-        version = buffer::stol(http_version) * 1000;
-    }
+    parse_http_version(request_version);
 
-    if (version > 1000) {
+    if (response_version > 1000 && !force_close) {
         keep_alive = true;
     }
 
@@ -486,6 +499,22 @@ HTTPParser::parse_request_head()
         }
         break;
     }
+    case RequestHeader::CONNECTION:
+    {
+        if (copy_found_line())
+            return TERMINATE;
+
+        buffer::istring connection;
+        if (get_header_value(connection, colon))
+            return TERMINATE;
+
+        if (connection == CLOSE) {
+            force_close = true;
+        } else if (connection == KEEP_ALIVE) {
+            force_close = false;
+        }
+        break;
+    }
     case RequestHeader::VIA:
         via = found_line;
         break;
@@ -549,7 +578,7 @@ HTTPParser::Status HTTPParser::parse_response_head()
         if (get_header_value(connection, colon))
             return TERMINATE;
 
-        if (connection == KEEP_ALIVE) {
+        if (!force_close && connection == KEEP_ALIVE) {
             keep_alive = true;
         } else if (connection == CLOSE) {
             keep_alive = false;

@@ -63,14 +63,18 @@ public:
     buffer::string status_code;
     buffer::string reason_phrase;
     bool keep_alive = false; // is not reset
-    unsigned version = 0; // is not reset
+    bool force_close = false; // is not reset
+    unsigned request_version = 0; // is not reset
+    unsigned response_version = 0; // is not reset
 
     /* Common properties */
     buffer::string http_version;
-    uint32_t content_length;
+    size_t content_length;
+    static const size_t cl_unset = -1;
     bool chunked;
 
     HTTPParser(IOBuffer &input_buf_, IOBuffer &output_buf_, int conn_fd);
+    void parse_http_version(unsigned& version);
     Status parse_request_line();
     Status parse_response_line();
     Status parse_request_head();
@@ -78,6 +82,7 @@ public:
     Status parse_head(buffer::string &recv_chunk);
     Status parse_body(buffer::string &recv_chunk);
     bool next_line();
+
 
     enum CRLFSearch
     {
@@ -103,7 +108,7 @@ private:
     void reset()
     {
         port = 80;
-        content_length = 0;
+        content_length = cl_unset;
         chunked = false;
         skip_chunk = 0;
         marker_hoarder = 0;

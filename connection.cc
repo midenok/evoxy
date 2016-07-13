@@ -95,12 +95,15 @@ Proxy::Frontend::read_callback()
                 return true;
             }
             debug("F: got request to ", parser.host, ", URI: ", parser.request_uri);
-            progress = ((parser.content_length == 0 && !parser.chunked) ?
-                REQUEST_FINISHED :
-                REQUEST_HEAD_FINISHED);
+
+            progress =
+                parser.content_length == 0 ||
+                parser.content_length == HTTPParser::cl_unset && !parser.chunked ?
+                    REQUEST_FINISHED :
+                    REQUEST_HEAD_FINISHED;
 
             debug("F: changed progress: ", progress);
-            if (parser.keep_alive) {
+            if (parser.keep_alive) { // this flag is set only on response
                 backend.start_only_events(EV_WRITE);
             } else {
                 if (backend.connect(parser.host_cstr, parser.port)) {
@@ -358,22 +361,42 @@ Proxy::Backend::read_callback()
 
         switch (s) {
         case HTTPParser::PROCEED: // reached head end
-            debug("B: got response: ", parser.status_code, ' ', parser.reason_phrase);
-            progress = ((parser.content_length == 0 && !parser.chunked) ?
+        {
+        #ifndef NDEBUG
+            char cl[20] = "unset";
+            if (parser.content_length != HTTPParser::cl_unset)
+                snprintf(cl, sizeof(cl), "%d", parser.content_length);
+
+            debug("B: got response: ",
+                parser.status_code, ' ', parser.reason_phrase,
+                " (cl: ", cl,
+                ", chunked: ", parser.chunked,
+                ", keep-alive: ", parser.keep_alive, ")");
+        #endif
+            progress = parser.content_length == 0 ?
                 RESPONSE_FINISHED :
-                RESPONSE_HEAD_FINISHED);
+                (parser.content_length == HTTPParser::cl_unset && !parser.chunked ?
+                    (parser.keep_alive ? RESPONSE_FINISHED : RESPONSE_WAIT_SHUTDOWN) :
+                    RESPONSE_HEAD_FINISHED);
             debug("B: changed progress: ", progress);
 
             // ... and start EV_WRITE when we finished the head.
             frontend.start_only_events(EV_WRITE);
 
-            if (progress == RESPONSE_FINISHED)
+            switch (progress) {
+            case RESPONSE_FINISHED:
                 goto RESPONSE_FINISHED;
+            case RESPONSE_WAIT_SHUTDOWN:
+                goto RESPONSE_WAIT_SHUTDOWN;
+            default:
+                break;
+            }
 
             if (recv_chunk.empty())
                 return false;
 
             break;
+        }
         case HTTPParser::TERMINATE:
             error("B: parsing HTTP response failed!");
             proxy.release();
@@ -400,6 +423,13 @@ Proxy::Backend::read_callback()
             frontend.start_events(EV_WRITE);
             return false;
         } // switch (HTTPParser::Status)
+
+    RESPONSE_WAIT_SHUTDOWN:
+    case RESPONSE_WAIT_SHUTDOWN:
+        // In case of non-persistent connection we just pass body of unknown size
+        // to frontend until we receive connection shutdown.
+        // TODO: maybe timeout it or put maxbody limit
+        return false;
 
     case RESPONSE_FINISHED:
     RESPONSE_FINISHED:

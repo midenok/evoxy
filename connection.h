@@ -198,6 +198,10 @@ public:
 class IOBuffer : public buffer::string
 {
     buffer::string buffer;
+#ifndef NDEBUG
+    size_t total_sent = 0;
+    size_t total_received = 0;
+#endif
 
 public:
     enum Status
@@ -214,6 +218,11 @@ public:
         buffer { buffer_ }
     {}
 
+    ~IOBuffer()
+    {
+        debug("Total sent: ", total_sent, "; received: ", total_received);
+    }
+
     void reset()
     {
         assign(buffer.begin(), size_type(0));
@@ -229,7 +238,7 @@ public:
         return buffer.end() - end();
     }
 
-    buffer::string::pointer buffer_begin()
+    pointer buffer_begin()
     {
         return buffer.begin();
     }
@@ -289,6 +298,9 @@ public:
         }
         recv_chunk.assign(end(), recv_size);
         grow(recv_size);
+    #ifndef NDEBUG
+        total_received += recv_size;
+    #endif
         assert(end() <= buffer.end());
         return OK;
     }
@@ -313,7 +325,9 @@ public:
         if (sent_size == 0)
             return WOULDBLOCK; // unexpected
 
-        // debug("sent ", sent_size, " bytes");
+    #ifndef NDEBUG
+        total_sent += sent_size;
+    #endif
 
         shrink_front(sent_size);
         return OK;
@@ -330,6 +344,7 @@ class Proxy :
         REQUEST_FINISHED,
         RESPONSE_STARTED,
         RESPONSE_HEAD_FINISHED,
+        RESPONSE_WAIT_SHUTDOWN,
         RESPONSE_FINISHED
     };
 
