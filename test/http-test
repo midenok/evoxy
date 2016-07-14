@@ -684,7 +684,7 @@ sub worker_thread
                 unless ($test->check_request($sent, $req)) {
                     $c->error("S: request $id check failed!");
                     $RunS = 0;
-                    Tests::stop();
+                    Tests::exit(2);
                     last loop;
                 }
                 $c->verbose("S: request $id check success!");
@@ -833,7 +833,7 @@ sub client_thread
             unless ($test->check_response($sent, $resp)) {
                 $c->error("C: response $id check failed!");
                 $RunC = 0;
-                Tests::stop();
+                Tests::exit(3);
                 last loop;
             }
             $c->verbose("C: response $id check success!");
@@ -1004,10 +1004,11 @@ sub run
     }
 }
 
-sub stop
+sub exit
 {
+    my $code = shift;
     my $c = Config::get;
-    $c->{force_stop} = 1;
+    $c->{force_stop} = $code;
     lock %Tests;
     %Tests = ();
     cond_signal %Tests;
@@ -1470,6 +1471,7 @@ sub next_chunk
         return $buf;
     }
     close $fh;
+    delete $self->{fh};
     return undef;
 }
 
@@ -1517,10 +1519,6 @@ use Net::HTTP;
 use HTTP::Request;
 use HTTP::Response;
 
-my $SendBufW :shared;
-my $SendBufR :shared;
-my %SendBuf :shared;
-
 sub send_init
 {
     return $_[0];
@@ -1560,16 +1558,6 @@ sub send_request
         while ($len = sysread $fh, $buf, 4096) {
             $ua->write_chunk($buf) or
                 Threads::die "write_chunk() failed!";
-
-            my $err = $!;
-            if ($c->{check_request}) {
-                lock %SendBuf;
-                cond_wait $SendBufW, %SendBuf
-                    while exists $SendBuf{$id};
-                $SendBuf{$id} = $buf;
-                lock $SendBufR;
-                cond_signal $SendBufR;
-            }
         }
 
         close $fh;
@@ -1594,29 +1582,30 @@ sub chunk
     my $self = shift;
     my $chunk = shift;
     my $got_len = length $chunk;
+    my $c = Config::get;
     return $got_len
-        unless Config::get->{check_request};
+        unless $c->{check_request};
 
+    my $fh = $self->{fh};
+    unless (defined $fh) {
+        open $fh, "<", $c->{file}
+            or Threads::die "$!";
+        $self->{fh} = $fh
+    }
+    
+    my $buf;
+    my $len = sysread $fh, $buf, $got_len;
+    Threads::die "$c->{file}: can't read desired count of bytes!"
+        if $len != $got_len;
+        
     my $id = $self->{id};
-    my $sent;
-    {    
-        lock %SendBuf;
-        cond_wait $SendBufR, %SendBuf
-            until exists $SendBuf{$id};
-        $sent = $SendBuf{$id};
-        delete $SendBuf{$id};
-        lock $SendBufW;
-        cond_signal $SendBufW;
-    }
 
-    my $sent_len = length $sent;
-    if ($sent_len != $got_len) {
-        Threads::die "Wrong request chunk size: ${got_len}, expected ${sent_len}\n";
+    if ($len != $got_len) {
+        Threads::die "Wrong request chunk size: ${got_len}, expected ${len}\n";
     }
-    if ($sent ne $chunk) {
+    if ($buf ne $chunk) {
         Threads::die "Request chunk content mismatch!\n";
     }
-
     return $got_len;
 }
 
@@ -1634,7 +1623,7 @@ Client::start();
 for my $test ($c->tests) {
     Tests::run($test);
     Tests::wait();
-    if ($c->{stop}) {
+    if ($c->{force_stop}) {
         last;
     }
 }
@@ -1646,4 +1635,4 @@ Server::stop();
 
 Threads::join();
 
-1;
+exit ($c->{force_stop} || 0);
