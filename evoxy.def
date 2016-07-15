@@ -12,6 +12,13 @@ flag = {
 };
 
 flag = {
+    name      = trace;
+    value     = T;        /* flag style option character */
+    max       = 1;        /* occurrence limit (none)     */
+    descrip   = "Generate trace output to STDOUT";
+};
+
+flag = {
     name      = daemonize;
     value     = d;        /* flag style option character */
     max       = 1;        /* occurrence limit (none)     */

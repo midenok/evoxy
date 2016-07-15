@@ -58,6 +58,7 @@ void debug_message(OStream& out, char q1, const char* file, int line, char q2, O
 
 #ifdef NDEBUG
 #define debug(...)
+#define trace(...)
 #define cdebug(...)
 #define error(...) stream_all(std::cerr, __VA_ARGS__)
 #define cerror(func, ...) stream_all(std::cerr, __VA_ARGS__)
@@ -65,6 +66,9 @@ void debug_message(OStream& out, char q1, const char* file, int line, char q2, O
 #define debug(...) \
 if (ENABLED_OPT(VERBOSE)) \
     debug_message(std::cout, '{', __FILE__, __LINE__, '}', this, __FUNCTION__, "(): ", __VA_ARGS__)
+#define trace(...) \
+if (ENABLED_OPT(TRACE)) \
+    debug_message(std::cout, '<', __FILE__, __LINE__, '>', this, __FUNCTION__, "(): ", __VA_ARGS__)
 #define cdebug(...) \
 if (ENABLED_OPT(VERBOSE)) \
     debug_message(std::cout, '{', __FILE__, __LINE__, '}', __FUNCTION__, "(): ", __VA_ARGS__)

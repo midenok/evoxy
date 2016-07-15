@@ -411,7 +411,8 @@ HTTPParser::parse_request_head()
     if (found_line.size() == CRLF.size()) {
         // found CRLFCRLF sequence
         if (!chunked) {
-            skip_chunk = content_length;
+            skip_chunk = content_length == cl_unset ? 0 : content_length;
+            trace("skip_chunk = ", skip_chunk, " (finished request head)");
         }
 
         if (copy_modified_headers())
@@ -537,7 +538,8 @@ HTTPParser::Status HTTPParser::parse_response_head()
     if (found_line.size() == CRLF.size()) {
         // found CRLFCRLF sequence
         if (!chunked) {
-            skip_chunk = content_length;
+            skip_chunk = content_length == cl_unset ? 0 : content_length;
+            trace("skip_chunk = ", skip_chunk, " (finished response head)");
         }
         return PROCEED;
     }
@@ -654,6 +656,7 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string &recv_chunk)
                 } else {
                     crlf_search = NO_SEARCH;
                     skip_chunk = marker_hoarder;
+                    trace("skip_chunk = ", skip_chunk, " (restored from marker_hoarder)");
                     marker_hoarder = 0;
                 }
                 continue;
@@ -727,6 +730,7 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string &recv_chunk)
 
         if (skip_chunk >= recv_chunk.size()) {
             skip_chunk -= recv_chunk.size();
+            trace("skip_chunk = ", skip_chunk, " (-", recv_chunk.size(), " recv_chunk)");
             if (skip_chunk == 0) {
                 if (!chunked)
                     return PROCEED;
@@ -743,6 +747,7 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string &recv_chunk)
             assert(marker_hoarder == 0);
             recv_chunk.shrink_front(skip_chunk);
             skip_chunk = 0;
+            trace("skip_chunk = 0 (recv_chunk shrinked to ", recv_chunk.size(), ")");
             crlf_search = CHUNK_CR_EXPECT;
             continue;
         }
@@ -774,15 +779,17 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string &recv_chunk)
         }
 
         if (marker_hoarder) {
-            unsigned bits = digits << 3; // bits to shift
+            unsigned bits = digits << 2; // bits to shift
             if (marker_hoarder > SIZE_MAX >> bits) {
                 debug("Wrong chunk marker: too big!");
                 return TERMINATE;
             }
             marker_hoarder <<= bits;
             marker_hoarder += marker_part;
+            trace("marker_hoarder = ", marker_hoarder, " (added marker_part ", marker_part, ", ", digits, " digits)");
         } else {
             marker_hoarder = marker_part;
+            trace("marker_hoarder = ", marker_hoarder, " (found marker beginning)");
         }
 
         if (digits == recv_chunk.size()) {

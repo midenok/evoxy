@@ -202,6 +202,7 @@ class IOBuffer : public buffer::string
 {
     buffer::string buffer;
 #ifndef NDEBUG
+    bool display_total = true;
     size_t total_sent = 0;
     size_t total_received = 0;
 #endif
@@ -223,7 +224,28 @@ public:
 
     ~IOBuffer()
     {
-        debug("Total sent: ", total_sent, "; received: ", total_received);
+    #ifndef NDEBUG
+        if (display_total)
+            debug("Total sent: ", total_sent, "; received: ", total_received);
+    #endif
+    }
+
+    // Non-default copy constructor and assignment are just for suppressing debug output
+    // from swap algorithm!
+    IOBuffer(const IOBuffer& src) :
+        buffer::string(src),
+        buffer(src.buffer)
+    {
+    #ifndef NDEBUG
+        display_total = false;
+    #endif
+    }
+
+    IOBuffer& operator= (const IOBuffer& src)
+    {
+        buffer::string::operator=(src);
+        buffer = src.buffer;
+        return *this;
     }
 
     void reset()

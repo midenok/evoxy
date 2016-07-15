@@ -98,7 +98,7 @@ Proxy::Frontend::read_callback()
             {
                 char cl[20] = "unset";
                 if (parser.content_length != HTTPParser::cl_unset)
-                    snprintf(cl, sizeof(cl), "%d", parser.content_length);
+                    snprintf(cl, sizeof(cl), "%lu", parser.content_length);
 
                 debug("F: got request to ", parser.host, ", URI: ", parser.request_uri,
                     " (cl: ", cl,
@@ -376,7 +376,7 @@ Proxy::Backend::read_callback()
         #ifndef NDEBUG
             char cl[20] = "unset";
             if (parser.content_length != HTTPParser::cl_unset)
-                snprintf(cl, sizeof(cl), "%d", parser.content_length);
+                snprintf(cl, sizeof(cl), "%lu", parser.content_length);
 
             debug("B: got response: ",
                 parser.status_code, ' ', parser.reason_phrase,
