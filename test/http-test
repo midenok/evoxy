@@ -23,6 +23,9 @@ my %CONFIG = (
     max_time  => 0,
     check_request => 1,
     check_response => 1,
+    chunk_size => 4096,
+    min_random => 1,
+    max_random => 4096,
     stop_timeout => 3 # secs
 );
 
@@ -65,7 +68,7 @@ my %OPTIONS = (
     check_response  => ['chresp', '!', "Compare responses sent by server and received by client"],
     no_check        => ['nochk', '', "Same as: --no-check-request --no-check-response"],
     file            => ['f', '=s', "Existing file that will be read by some tests"],
-    exit_running    => ['X', '', "If can't bind HTTP server, try to stop the running one"],
+    chunk_size      => ['cs', '=i', "Chunk size for chunked file transfers; 0 means random chunk size"],
     quiet           => ['q', '', 'Quiet operation'],
     verbose         => ['v', '+', 'Verbose operation'],
     dump            => ['D', '+', 'Dump state at certain runpoint'],
@@ -212,6 +215,13 @@ sub process_options
     }
     delete $c->{max_requests_default};
 
+    if ($c->{max_random} <= $c->{min_random}) {
+        die "--max-random must be greater than --min-random!\n";
+    }
+    if ($c->{min_random} < 1) {
+        die "--min-random must be not less than 1!\n";
+    }
+
     my @tests = split(',', $c->{test});
     my @test_list;
     for my $test (@tests) {
@@ -278,6 +288,17 @@ sub error
 {
     my $c = shift;
     print STDERR @_, "\n";
+}
+
+sub chunk_size
+{
+    my $c = shift;
+    if ($c->{chunk_size}) {
+        return $c->{chunk_size};
+    }
+    my $min = $c->{min_random};
+    my $max = $c->{max_random};
+    return int(rand($max - $min + 1)) + $min;
 }
 
 1;
@@ -381,7 +402,9 @@ sub get_body
                     return unless $n;
                     $missing -= $n;
                 }
-                $length += $hook->chunk(substr($buf, 0, $size));
+                my $l = $hook->chunk(substr($buf, 0, $size))
+                    or return;
+                $length += $l;
                 substr($buf, 0, $size+2) = '';
             }
             else {
@@ -390,7 +413,8 @@ sub get_body
             }
         }
 
-        $hook->chunks_done($r);
+        $hook->chunks_done($r)
+            or return;
         # pretend it was a normal entity body
         $r->remove_header('Transfer-Encoding');
         $r->header('Content-Length', $length);
@@ -675,8 +699,12 @@ sub worker_thread
             $c->verbose("S: got request ${id}");
 
             my $test = Tests::get_test($id);
-            $conn->get_body($req, $test)
-                or Threads::die "Server failed to parse body!\n";
+            unless ($conn->get_body($req, $test)) {
+                $c->error("S: request $id failure!\n");
+                $RunS = 0;
+                Tests::exit(2);
+                last loop;
+            }
 
             if ($c->{check_request}) {
                 my $sent = Client::get_request($id)
@@ -939,12 +967,8 @@ sub print
     my $self = shift;
     my $reqs = shift;
     my $elpsd = $self->{elapsed};
-    my $reqs_per_sec = $reqs / $elpsd;
-    {
-        use integer;
-        $reqs_per_sec /= 1;
-    }
-    Config::get->print("      finished in $elpsd secs; $reqs_per_sec requests/sec");
+    my $reqs_per_sec = int($reqs / $elpsd);
+    Config::get->print("      finished in ". int($elpsd). " secs; $reqs_per_sec requests/sec");
 }
 
 sub run_time
@@ -1373,6 +1397,7 @@ sub chunks_done
     my $self = shift;
     my $req = shift;
     $req->content($self->{body});
+    return 1;
 }
 
 1;
@@ -1415,6 +1440,7 @@ sub chunks_done
 {
     my $self = shift;
     my $req = shift;
+    return 1;
 }
 
 1;
@@ -1461,9 +1487,10 @@ sub next_chunk
 {
     my $self = shift;
     my $fh = $self->{fh};
+    my $chunk_size = Config::get->chunk_size;
 
-    my ($len, $buf);
-    $len = sysread $fh, $buf, 4096;
+    my $buf;
+    my $len = sysread $fh, $buf, $chunk_size;
     if ($len < 0) {
         Threads::die "sysread: $!";
     }
@@ -1555,7 +1582,7 @@ sub send_request
             or Threads::die "$!";
 
         my ($len, $buf);
-        while ($len = sysread $fh, $buf, 4096) {
+        while ($len = sysread $fh, $buf, $c->chunk_size()) {
             $ua->write_chunk($buf) or
                 Threads::die "write_chunk() failed!";
         }
@@ -1590,23 +1617,42 @@ sub chunk
     unless (defined $fh) {
         open $fh, "<", $c->{file}
             or Threads::die "$!";
-        $self->{fh} = $fh
+        $self->{fh} = $fh;
+        $self->{file_size} = (stat $fh)[7];
+        $self->{got_size} = 0;
     }
-    
+
     my $buf;
     my $len = sysread $fh, $buf, $got_len;
     Threads::die "$c->{file}: can't read desired count of bytes!"
         if $len != $got_len;
-        
+
     my $id = $self->{id};
 
     if ($len != $got_len) {
-        Threads::die "Wrong request chunk size: ${got_len}, expected ${len}\n";
+        $c->error("Request chunk at $self->{got_size} wrong size: ${got_len}, expected ${len}\n");
+        return 0;
     }
     if ($buf ne $chunk) {
-        Threads::die "Request chunk content mismatch!\n";
+        $c->error("Request chunk at $self->{got_size} mismatch!\n");
+        return 0;
     }
+    $self->{got_size} += $got_len;
     return $got_len;
+}
+
+sub chunks_done
+{
+    my $self = shift;
+    my $c = Config::get;
+    return 1
+        unless $c->{check_request};
+
+    if ($self->{got_size} != $self->{file_size}) {
+        $c->error("Incomplete transfer: got $self->{got_size}; expected $self->{file_size}!\n");
+        return 0;
+    }
+    return 1;
 }
 
 1;
