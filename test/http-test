@@ -705,7 +705,8 @@ sub worker_thread
             }
             $c->verbose("S: got request ${id}");
 
-            my $test = Tests::get_test($id);
+            my $test = Tests::get_test($id) or
+                last loop;
             unless ($conn->get_body($req, $test)) {
                 $c->error("S: request $id failure!\n");
                 $RunS = 0;
@@ -860,7 +861,8 @@ sub client_thread
             }
         }
 
-        my $test = Tests::get_test($id);
+        my $test = Tests::get_test($id) or
+            last loop;
         $test->send_init;
         $c->verbose("C: sending request $id");
         my $resp = $test->send_request($id);
@@ -1057,6 +1059,10 @@ sub exit
     cond_signal %Tests;
 }
 
+$SIG{INT} = sub {
+    Tests::exit(10);
+};
+
 sub print_total
 {
     my $c = Config::get;
@@ -1103,9 +1109,16 @@ sub checkpoint
 sub get_test
 {
     my $id = shift;
-    my $test = $Tests{$id};
-    die "No test for req ${id}" unless $test;
     my $c = Config::get;
+    my $test;
+    {
+        lock %Tests;
+        if ($c->{force_stop}) {
+            return;
+        }
+        $test = $Tests{$id};
+        Threads::die "No test for req ${id}" unless $test;
+    }
     my $t = $c->new_test($test);
     $t->{id} = $id;
     return $t;
