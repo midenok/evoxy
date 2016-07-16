@@ -18,7 +18,7 @@ my %CONFIG = (
     keep_alive => 1,
     server_threads => 1,
     client_threads => 1,
-    raw_chunks_delay => 100, # usecs
+    raw_chunks_delay => 200, # usecs
     max_requests_default => 1,
     max_time  => 0,
     check_request => 1,
@@ -26,7 +26,8 @@ my %CONFIG = (
     chunk_size => 4096,
     min_random => 1,
     max_random => 4096,
-    stop_timeout => 3 # secs
+    stop_timeout => 3, # secs
+    split_request => 0
 );
 
 our @TESTS = (
@@ -69,6 +70,8 @@ my %OPTIONS = (
     no_check        => ['nochk', '', "Same as: --no-check-request --no-check-response"],
     file            => ['f', '=s', "Existing file that will be read by some tests"],
     chunk_size      => ['cs', '=i', "Chunk size for chunked file transfers; 0 means random chunk size"],
+    random          => ['r', '', "Same as: --chunk_size 0" ],
+    split_request   => ['spreq', '=i', "Split and send request by N bytes (works with raw, raw_chunked)"],
     quiet           => ['q', '', 'Quiet operation'],
     verbose         => ['v', '+', 'Verbose operation'],
     dump            => ['D', '+', 'Dump state at certain runpoint'],
@@ -220,6 +223,10 @@ sub process_options
     }
     if ($c->{min_random} < 1) {
         die "--min-random must be not less than 1!\n";
+    }
+    
+    if ($c->{random}) {
+        $c->{chunk_size} = 0;
     }
 
     my @tests = split(',', $c->{test});
@@ -850,7 +857,12 @@ sub client_thread
         $test->send_init;
         $c->verbose("C: sending request $id");
         my $resp = $test->send_request($id);
-        Threads::die "$!" if $!;
+        unless ($resp) {
+            $c->error("C: request $id send failed!");
+            $RunC = 0;
+            Tests::exit(1);
+            last loop;
+        }
         $c->verbose("C: got response $id");
         $resp->request(undef); # TODO: actually we don't need %ReqSent since we can pass req in resp
 
@@ -1183,7 +1195,12 @@ sub send_request
     my $id = shift;
     my $ua = $self->{ua};
     my $req = $self->build_request($id);
-    return $ua->request($req);
+    my $resp = $ua->request($req);
+    if ($!) {
+        Config::get->error("request: $!");
+        return;
+    }
+    return $resp;
 }
 
 sub send_response
@@ -1278,8 +1295,10 @@ sub send_request
     my $id = shift;
 
     my $c = Config::get();
+    my $split = $c->{split_request};
     my $req_raw = $self->build_request($id);
     my @chunks = split('~~~', $req_raw);
+        
     my $req = HTTP::Request->parse(join('', @chunks));
 
     if ($c->{check_request}) {
@@ -1290,11 +1309,21 @@ sub send_request
     my $sock = IO::Socket::INET->new(
         PeerAddr => $c->{proxy_address} ? $c->{proxy_address} : $req->header('Host'),
         Proto => 'tcp'
-    ) or Threads::die "connect: $!";
+    ) or do {
+        $c->error("connect: $!");
+        return;
+    };
     setsockopt($sock, IPPROTO_TCP, TCP_NODELAY, 1);
     for my $chunk (@chunks) {
-        $sock->send($chunk);
-        usleep $c->{raw_chunks_delay};
+        if ($split) {
+            while (length $chunk) {
+                $sock->send(substr($chunk, 0, $split, ''));
+                usleep $c->{raw_chunks_delay};
+            }
+        } else {
+            $sock->send($chunk);
+            usleep $c->{raw_chunks_delay};
+        }
     }
     my $resp_raw;
     my $buf;
@@ -1560,7 +1589,10 @@ sub send_request
         Net::HTTP->new(
             Host => $c->{proxy_address} ? $c->{proxy_address} : $c->{connect_address},
             KeepAlive => $c->{keep_alive}))
-        or Threads::die "connect: $!";
+        or do {
+            $c->error("connect: $!");
+            return;
+        };
 
     {
         my @method_url = (POST => '/');
@@ -1572,7 +1604,10 @@ sub send_request
             'X-Request-Id' => $id);
 
         $ua->write_request(@method_url, @headers)
-            or Threads::die "write_request() failed!";
+            or do {
+                $c->error("write_request() failed!");
+                return;
+            };
 
         if ($c->{check_request}) {
             Client::push_req_sent(HTTP::Request->new(@method_url, \@headers), undef, undef, $id);
@@ -1583,13 +1618,17 @@ sub send_request
 
         my ($len, $buf);
         while ($len = sysread $fh, $buf, $c->chunk_size()) {
-            $ua->write_chunk($buf) or
-                Threads::die "write_chunk() failed!";
+            $ua->write_chunk($buf) or do {
+                $c->error("write_chunk() failed!");
+                return;
+            };
         }
 
         close $fh;
-        $ua->write_chunk_eof() or
-            Threads::die "write_chunk_eof() failed!";
+        $ua->write_chunk_eof() or do {
+            $c->error("write_chunk_eof() failed!");
+            return;
+        };
     }
 
     my $resp;
