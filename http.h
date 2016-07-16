@@ -111,7 +111,7 @@ private:
         content_length = cl_unset;
         chunked = false;
         skip_chunk = 0;
-        marker_hoarder = 0;
+        marker_hoarder = cl_unset;
         crlf_search = NO_SEARCH;
         body_end = false;
         no_transform = false;

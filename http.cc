@@ -654,10 +654,11 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string &recv_chunk)
                     crlf_search = CHUNK_CR_EXPECT;
                     body_end = true;
                 } else {
+                    assert(marker_hoarder != cl_unset);
                     crlf_search = NO_SEARCH;
                     skip_chunk = marker_hoarder;
                     trace("skip_chunk = ", skip_chunk, " (restored from marker_hoarder)");
-                    marker_hoarder = 0;
+                    marker_hoarder = cl_unset;
                 }
                 continue;
             }
@@ -744,7 +745,7 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string &recv_chunk)
                 // Body is larger than expected!
                 return PROCEED;
             }
-            assert(marker_hoarder == 0);
+            assert(marker_hoarder == cl_unset);
             recv_chunk.shrink_front(skip_chunk);
             skip_chunk = 0;
             trace("skip_chunk = 0 (recv_chunk shrinked to ", recv_chunk.size(), ")");
@@ -752,7 +753,7 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string &recv_chunk)
             continue;
         }
 
-        if (marker_hoarder && (recv_chunk[0] == '\r' || recv_chunk[0] == ';')) {
+        if (marker_hoarder != cl_unset && (recv_chunk[0] == '\r' || recv_chunk[0] == ';')) {
             crlf_search = MARKER_CR_SEARCH;
             continue;
         }
@@ -769,7 +770,7 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string &recv_chunk)
         long marker_part = buffer::stol(recv_chunk, &digits, 16);
 
         if (errno) {
-            debug("Wrong chunk marker: ", strerror(errno));
+            debug("Wrong chunk marker '", recv_chunk, "': ", strerror(errno));
             return TERMINATE;
         }
 
@@ -778,7 +779,10 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string &recv_chunk)
             return TERMINATE;
         }
 
-        if (marker_hoarder) {
+        if (marker_hoarder == cl_unset) {
+            marker_hoarder = marker_part;
+            trace("marker_hoarder = ", marker_hoarder, " (found marker beginning)");
+        } else {
             unsigned bits = digits << 2; // bits to shift
             if (marker_hoarder > SIZE_MAX >> bits) {
                 debug("Wrong chunk marker: too big!");
@@ -787,9 +791,6 @@ HTTPParser::Status HTTPParser::parse_body(buffer::string &recv_chunk)
             marker_hoarder <<= bits;
             marker_hoarder += marker_part;
             trace("marker_hoarder = ", marker_hoarder, " (added marker_part ", marker_part, ", ", digits, " digits)");
-        } else {
-            marker_hoarder = marker_part;
-            trace("marker_hoarder = ", marker_hoarder, " (found marker beginning)");
         }
 
         if (digits == recv_chunk.size()) {
