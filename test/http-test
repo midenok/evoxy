@@ -26,7 +26,7 @@ my %CONFIG = (
     chunk_size => 4096,
     min_random => 1,
     max_random => 4096,
-    stop_timeout => 3, # secs
+    stop_timeout => 10, # secs
     split_request => 0
 );
 
@@ -804,15 +804,21 @@ use Storable qw[freeze thaw];
 
 my $RunC :shared;
 
-use constant MAX_REQS => 1000;
+my $QueueSize;
 my @CQueue :shared;
 my $CQFreed :shared;
 my %ReqSent :shared;
 
+sub setup_queue
+{
+    $QueueSize = Config::get->{client_threads} * 2;
+}
+
 sub start
 {
+    setup_queue();
     $RunC = 1;
-    Threads::start(Config::get()->{client_threads}, \&client_thread);
+    Threads::start(Config::get->{client_threads}, \&client_thread);
 }
 
 my $ClientThreads :shared;
@@ -837,6 +843,7 @@ sub client_thread
     {lock $ClientThreads;
     ++$ClientThreads;}
     my $c = Config::get();
+    setup_queue();
 
     loop:
     while ($RunC) {
@@ -847,7 +854,7 @@ sub client_thread
                 until @CQueue || !$RunC;
             last loop unless $RunC;
             $id = shift @CQueue;
-            if (@CQueue == MAX_REQS - 1) {
+            if (@CQueue == $QueueSize - 1) {
                 lock $CQFreed;
                 cond_signal $CQFreed;
             }
@@ -907,7 +914,7 @@ sub enqueue
     my $id = shift;
     lock @CQueue;
     cond_wait $CQFreed, @CQueue
-        until @CQueue < MAX_REQS;
+        until @CQueue < $QueueSize;
     push @CQueue, $id;
     cond_signal @CQueue;
 }
@@ -1572,8 +1579,10 @@ use threads;
 use threads::shared;
 
 use Net::HTTP;
+use Socket qw[:all];
 use HTTP::Request;
 use HTTP::Response;
+use Time::HiRes 'usleep';
 
 sub send_init
 {
@@ -1585,14 +1594,21 @@ sub send_request
     my $self = shift;
     my $id = shift;
     my $c = Config::get;
-    my $ua = $self->{ua} || ($self->{ua} =
-        Net::HTTP->new(
+    my $split = $c->{split_request};
+    my $ua = $self->{ua};
+    if (! $ua) {
+        $ua = Net::HTTP->new(
             Host => $c->{proxy_address} ? $c->{proxy_address} : $c->{connect_address},
-            KeepAlive => $c->{keep_alive}))
+            KeepAlive => $c->{keep_alive})
         or do {
             $c->error("connect: $!");
             return;
         };
+        if ($split) {
+            setsockopt($ua, IPPROTO_TCP, TCP_NODELAY, 1);
+        }
+        $self->{ua} = $ua;
+    }
 
     {
         my @method_url = (POST => '/');
@@ -1616,12 +1632,24 @@ sub send_request
         open my $fh, "<", $c->{file}
             or Threads::die "$!";
 
-        my ($len, $buf);
+        my ($len, $buf, $chunk);
         while ($len = sysread $fh, $buf, $c->chunk_size()) {
-            $ua->write_chunk($buf) or do {
-                $c->error("write_chunk() failed!");
-                return;
-            };
+            if ($split) {
+                my $chunk = sprintf("%x", $len) . $CRLF . $buf . $CRLF;
+                while (length $chunk) {
+                    $ua->send(substr($chunk, 0, $split, '')) or do {
+                        $c->error("write_chunk() failed!");
+                        return;
+                    };
+                    usleep $c->{raw_chunks_delay};
+                }
+            } else {
+                $ua->write_chunk($buf)
+                or do {
+                    $c->error("write_chunk() failed!");
+                    return;
+                };
+            }
         }
 
         close $fh;
