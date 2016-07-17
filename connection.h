@@ -205,9 +205,18 @@ class IOBuffer : public buffer::string
     bool display_total = true;
     size_t total_sent = 0;
     size_t total_received = 0;
+    const char *prefix = "";
+#else
+    static const char * const prefix;
 #endif
 
 public:
+#ifndef NDEBUG
+    void debug_prefix(const char* _prefix)
+    {
+        prefix = _prefix;
+    }
+#endif
     enum Status
     {
         OK,
@@ -226,7 +235,7 @@ public:
     {
     #ifndef NDEBUG
         if (display_total)
-            debug("Total sent: ", total_sent, "; received: ", total_received);
+            debug(prefix, "Total sent: ", total_sent, "; received: ", total_received);
     #endif
     }
 
@@ -305,7 +314,7 @@ public:
         }
         ssize_t recv_size = ::recv(fd, const_cast<char*>(end()), free_size, 0);
         if (recv_size == 0) {
-            debug("peer shutdown");
+            debug(prefix, "peer shutdown");
             return SHUTDOWN;
         }
         if (recv_size < 0) {
@@ -314,10 +323,10 @@ public:
                 return WOULDBLOCK;
             case ECONNRESET:
             case ENOTCONN:
-                debug("peer reset");
-                return OTHER_ERROR;
+                // error(prefix, "peer reset");
+                // return OTHER_ERROR;
             default:
-                error("recv: ", strerror(errno));
+                error(prefix, "recv: ", strerror(errno));
                 return OTHER_ERROR;
             }
         }
@@ -339,10 +348,10 @@ public:
                 return WOULDBLOCK;
             case ECONNRESET:
             case ENOTCONN:
-                debug("peer reset");
-                return OTHER_ERROR;
+                // error(prefix, "peer reset");
+                // return OTHER_ERROR;
             default:
-                error("send: ", strerror(errno));
+                error(prefix, "send: ", strerror(errno));
                 return OTHER_ERROR;
             }
         }

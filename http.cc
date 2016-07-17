@@ -355,7 +355,7 @@ HTTPParser::Status HTTPParser::parse_response_line()
     }
 
     http_version.assign(&found_line[sep], &found_line[sp1]);
-    parse_http_version(request_version);
+    parse_http_version(response_version);
 
     if (response_version > 1000 && !force_close) {
         keep_alive = true;

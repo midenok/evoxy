@@ -10,6 +10,10 @@ Proxy::Proxy(struct ev_loop* event_loop_, int conn_fd) :
     frontend(event_loop_, conn_fd, *this),
     backend(event_loop_, *this)
 {
+#ifndef NDEBUG
+    frontend_buffer.debug_prefix("F: ");
+    backend_buffer.debug_prefix("B: ");
+#endif
 }
 
 Proxy::Frontend::Frontend(
@@ -451,3 +455,7 @@ Proxy::Backend::read_callback()
     } // switch (progress)
     return false;
 }
+
+#ifdef NDEBUG
+const char * const IOBuffer::prefix = "";
+#endif

@@ -1117,7 +1117,9 @@ sub get_test
             return;
         }
         $test = $Tests{$id};
-        Threads::die "No test for req ${id}" unless $test;
+    }
+    unless ($test) {
+        Threads::die "No test for req ${id}";
     }
     my $t = $c->new_test($test);
     $t->{id} = $id;
