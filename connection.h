@@ -408,6 +408,7 @@ class Proxy :
         char host_cstr[max_host_size + 1];
         buffer::istring host;
         in_addr host_ip;
+        uint32_t port = 0;
 
         bool
         set_host(buffer::istring &_host)

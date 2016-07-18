@@ -119,33 +119,32 @@ Proxy::Frontend::read_callback()
 
             debug("F: changed progress: ", progress);
             if (parser.keep_alive) { // this flag is set only on response
+                in_addr new_ip = host_ip;
                 if (parser.host != host) {
-                    in_addr new_ip;
                     if (set_host(parser.host) || resolve_host(new_ip)) {
                         debug("F: host resolution failed!");
                         proxy.release();
                         return true;
                     }
-                    if (new_ip.s_addr != host_ip.s_addr) {
-                        backend.shutdown();
-                        host_ip = new_ip;
-                        if (backend.connect(host_ip, parser.port)) {
-                            debug("F: backend connection failed!");
-                            proxy.release();
-                            return true;
-                        }
-                        debug("F: connected to ", host, ":", parser.port);
-                    } else {
-                        goto no_need_to_connect;
+                }
+                if (parser.port != port || new_ip.s_addr != host_ip.s_addr) {
+                    backend.shutdown();
+                    host_ip = new_ip;
+                    port = parser.port;
+                    if (backend.connect(host_ip, port)) {
+                        debug("F: backend connection failed!");
+                        proxy.release();
+                        return true;
                     }
+                    debug("F: connected to ", host, ":", port);
                 } else {
-                no_need_to_connect:
                     backend.start_only_events(EV_WRITE);
                 }
             } else {
+                port = parser.port;
                 if (set_host(parser.host) ||
                     resolve_host(host_ip) ||
-                    backend.connect(host_ip, parser.port))
+                    backend.connect(host_ip, port))
                 {
                     debug("F: backend connection (or host resolution) failed!");
                     proxy.release();
