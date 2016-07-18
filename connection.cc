@@ -119,14 +119,39 @@ Proxy::Frontend::read_callback()
 
             debug("F: changed progress: ", progress);
             if (parser.keep_alive) { // this flag is set only on response
-                backend.start_only_events(EV_WRITE);
+                if (parser.host != host) {
+                    in_addr new_ip;
+                    if (set_host(parser.host) || resolve_host(new_ip)) {
+                        debug("F: host resolution failed!");
+                        proxy.release();
+                        return true;
+                    }
+                    if (new_ip.s_addr != host_ip.s_addr) {
+                        backend.shutdown();
+                        host_ip = new_ip;
+                        if (backend.connect(host_ip, parser.port)) {
+                            debug("F: backend connection failed!");
+                            proxy.release();
+                            return true;
+                        }
+                        debug("F: connected to ", host, ":", parser.port);
+                    } else {
+                        goto no_need_to_connect;
+                    }
+                } else {
+                no_need_to_connect:
+                    backend.start_only_events(EV_WRITE);
+                }
             } else {
-                if (backend.connect(parser.host_cstr, parser.port)) {
-                    debug("F: backend connection failed!");
+                if (set_host(parser.host) ||
+                    resolve_host(host_ip) ||
+                    backend.connect(host_ip, parser.port))
+                {
+                    debug("F: backend connection (or host resolution) failed!");
                     proxy.release();
                     return true;
                 }
-                debug("F: connected to ", parser.host_cstr, ":", parser.port);
+                debug("F: connected to ", host, ":", parser.port);
             }
 
             if (progress == REQUEST_FINISHED)
@@ -164,11 +189,11 @@ Proxy::Frontend::read_callback()
         } // switch (HTTPParser::Status)
 
     case REQUEST_FINISHED:
+    default:
+        error("F: unexpected data on finished request!");
     REQUEST_FINISHED:
-        // We can't disable READ, because any time client can tear connection.
-        // In this case we need to tear backend ASAP!
-        // stop_events(EV_READ);
-        stop_all_events(); // FIXME: wrong!
+        // We can't disable READ, because any time client may tear connection.
+        ;
     } // switch (progress)
     return false;
 }
@@ -225,6 +250,25 @@ Proxy::Frontend::set_error(const buffer::string &err, int err_no)
     start_only_events(EV_WRITE);
 }
 
+bool Proxy::Frontend::resolve_host(in_addr &host_ip)
+{
+    struct addrinfo hints, *res;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_INET;
+
+    int err = getaddrinfo(host_cstr, NULL, &hints, &res);
+    if (err != 0) {
+        error("getaddrinfo: ", gai_strerror(err));
+        return true;
+    }
+
+    host_ip = ((sockaddr_in *) (res->ai_addr))->sin_addr;
+    freeaddrinfo(res);
+    return false;
+}
+
 
 Proxy::Backend::Backend(
         struct ev_loop* event_loop_,
@@ -236,37 +280,23 @@ Proxy::Backend::Backend(
     buffer { proxy.backend_buffer },
     frontend { proxy.frontend }
 {
-    int sock_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    if (sock_fd < 0) {
-        throw Errno("socket");;
-    }
-
-    conn_watcher.fd = sock_fd;
+    conn_watcher.fd = 0;
 }
 
 bool
-Proxy::Backend::connect(const char* host, uint32_t port)
+Proxy::Backend::connect(in_addr ip, uint32_t port)
 {
-    struct sockaddr_in serv_addr;
-    struct addrinfo hints, *res;
-
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(port);
-
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_family = AF_INET;
-
-    int err = getaddrinfo(host, NULL, &hints, &res);
-    if (err != 0) {
-        debug("getaddrinfo: ", gai_strerror(err));
-        return true;
+    conn_watcher.fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (conn_watcher.fd < 0) {
+        throw Errno("socket");;
     }
 
-    serv_addr.sin_addr = ((sockaddr_in *)(res->ai_addr))->sin_addr;
-    freeaddrinfo(res);
+    struct sockaddr_in serv_addr;
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(port);
+    serv_addr.sin_addr = ip;
 
-    err = ::connect(conn_watcher.fd, (struct sockaddr *) &serv_addr, sizeof(serv_addr));
+    int err = ::connect(conn_watcher.fd, (struct sockaddr *) &serv_addr, sizeof(serv_addr));
     if (err < 0 && errno != EINPROGRESS) {
         debug("connect: ", strerror(errno));
         return true;
@@ -447,11 +477,10 @@ Proxy::Backend::read_callback()
         return false;
 
     case RESPONSE_FINISHED:
+        error("B: unexpected data on finished response!");
     RESPONSE_FINISHED:
-        // We can't disable READ, because any time peer can tear connection.
-        // In this case we need to tear backend ASAP!
-        // stop_events(EV_READ);
-        stop_all_events(); // FIXME: WRONG WRONG WRONG!
+        // We can't disable READ, because any time backend may tear connection.
+        ;
     } // switch (progress)
     return false;
 }

@@ -404,6 +404,24 @@ class Proxy :
 
         ssize_t sent_size = 0;
 
+        static const size_t max_host_size = 253;
+        char host_cstr[max_host_size + 1];
+        buffer::istring host;
+        in_addr host_ip;
+
+        bool
+        set_host(buffer::istring &_host)
+        {
+            if (_host.size() > max_host_size) {
+                error("Host size ", host.size(), " is too large!");
+                return true;
+            }
+            _host.copy(host_cstr, max_host_size);
+            host_cstr[_host.size()] = 0;
+            host.assign(host_cstr, _host.size());
+            return false;
+        }
+
         Frontend(struct ev_loop* event_loop_, int conn_fd, Proxy &proxy_);
 
         bool read_callback() override;
@@ -412,6 +430,7 @@ class Proxy :
         { return false; }
 
         void set_error(const buffer::string &err, int err_no);
+        bool resolve_host(in_addr &host_ip);
     };
 
     struct Backend :
@@ -429,11 +448,21 @@ class Proxy :
 
         Backend(struct ev_loop* event_loop_, Proxy &proxy_);
 
-        bool connect(const char* host, uint32_t port);
+        bool connect(in_addr ip, uint32_t port);
 
         bool read_callback() override;
         bool write_callback() override;
         bool error_callback(int err) override;
+
+        void shutdown()
+        {
+            if (conn_watcher.fd) {
+                stop_all_events();
+                ::shutdown(conn_watcher.fd, SHUT_RDWR);
+                close(conn_watcher.fd);
+                conn_watcher.fd = 0;
+            }
+        }
     };
 
     Frontend frontend;

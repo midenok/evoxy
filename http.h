@@ -50,12 +50,10 @@ public:
     /* Request properties */
     buffer::string method;
     buffer::string request_uri;
-    buffer::string host;
+    buffer::istring host;
     buffer::string via;
     buffer::string x_forwarded_for;
 
-    const char* host_cstr;
-    char host_terminator; // currently unused
     bool no_transform;
     uint32_t port;
 

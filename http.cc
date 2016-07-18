@@ -376,11 +376,10 @@ HTTPParser::Status HTTPParser::parse_response_line()
     status_code.assign(&found_line[sp1], &found_line[sp2]);
     ++sp2;
     if (&found_line[sp2] >= found_line.end() - CRLF.size()) {
-        debug("Wrong request line: no Reason-Phrase!");
-        return TERMINATE;
+        reason_phrase.clear();
+    } else {
+        reason_phrase.assign(&found_line[sp2], found_line.end() - CRLF.size());
     }
-
-    reason_phrase.assign(&found_line[sp2], found_line.end() - CRLF.size());
     parse_line = &HTTPParser::parse_response_head;
     return CONTINUE;
 }
@@ -453,11 +452,6 @@ HTTPParser::parse_request_head()
             }
             host.assign(host.begin(), &host[colon]);
         }
-        // fix host terminator to make getaddrinfo happy
-        assert(host.end() < found_line.end());
-        host_terminator = *host.end();
-        *const_cast<char*>(host.end()) = 0;
-        host_cstr = host.begin();
         break;
     }
     case RequestHeader::CONTENT_LENGTH:
