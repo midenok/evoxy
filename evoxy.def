@@ -81,3 +81,23 @@ flag = {
     max       = 1;  /* occurrence limit (none)     */
     descrip   = "Recieve buffer size. Usually must be not smaller than largest HTTP head.";
 };
+
+flag = {
+    name      = name-cache;
+    value     = N;        /* flag style option character */
+    arg-type  = number;   /* option argument indication  */
+    arg-default = 1000;
+    max       = 1;  /* occurrence limit (none)     */
+    descrip   = "Internal name resolver cache size (per one thread).";
+    doc       = 'If set to 0, then cache is turned off.';
+};
+
+flag = {
+    name      = cache-lifetime;
+    value     = L;        /* flag style option character */
+    arg-type  = number;   /* option argument indication  */
+    arg-default = 600;
+    arg-range = "10->86400";
+    max       = 1;  /* occurrence limit (none)     */
+    descrip   = "Name resolver cache item lifetime (in seconds).";
+};

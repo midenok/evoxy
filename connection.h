@@ -19,6 +19,7 @@
 #include "buffer_string.h"
 #include "http.h"
 #include "util.h"
+#include "cache.h"
 
 class OnEventLoop :
     public virtual non_copyable
@@ -389,6 +390,7 @@ class Proxy :
     IOBuffer frontend_buffer;
     IOBuffer backend_buffer;
     HTTPParser parser;
+    NameCacheOnPool *name_cache;
 
     struct Backend;
 
@@ -402,6 +404,7 @@ class Proxy :
         HTTPParser &parser;
         IOBuffer &buffer;
         Backend &backend;
+        NameCacheOnPool *&name_cache;
 
         ssize_t sent_size = 0;
 
@@ -471,7 +474,7 @@ class Proxy :
     Backend backend;
 
 public:
-    Proxy(struct ev_loop* event_loop_, int conn_fd);
+    Proxy(struct ev_loop* event_loop_, int conn_fd, NameCacheOnPool *name_cache);
 }; // class Connection
 
 #endif // __udtproxy_connection_h

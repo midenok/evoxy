@@ -135,14 +135,16 @@ void check2(int pool_size, int timeout)
         exit(check + 10);
     }
 
+    in_addr host_ip;
+
     int i = -2;
     char name[33];
     try {
-        cache.insert("ya.ru");
-        cache.insert("mail.ru");
+        cache.insert(host_ip, "ya.ru");
+        cache.insert(host_ip, "mail.ru");
         for (i = 0; i <= pool_size; ++i) {
             snprintf(name, 33, "traktor%d.es", i);
-            cache.insert(name);
+            cache.insert(host_ip, name);
         }
     } catch (std::bad_alloc) {
         if (++check) {
@@ -170,7 +172,7 @@ void check2(int pool_size, int timeout)
         exit(check + 10);
     }
 
-    bool res = cache.get("ya.ru");
+    bool res = cache.get(host_ip, "ya.ru");
     if (++check, res != false) {
         std::cerr << "Failed check " << check_invocation <<
             "." << check << ": res = " << res
@@ -178,7 +180,7 @@ void check2(int pool_size, int timeout)
         exit(check);
     }
 
-    res = cache.get("traktor4.es");
+    res = cache.get(host_ip, "traktor4.es");
     if (++check, res != true) {
         std::cerr << "Failed check " << check_invocation <<
             "." << check << ": res = " << res
@@ -187,7 +189,7 @@ void check2(int pool_size, int timeout)
     }
 
     sleep(timeout + 1);
-    res = cache.get("traktor4.es");
+    res = cache.get(host_ip, "traktor4.es");
     if (++check, res != false) {
         std::cerr << "Failed check " << check_invocation <<
             "." << check << ": res = " << res

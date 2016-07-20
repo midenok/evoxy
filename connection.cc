@@ -3,10 +3,11 @@
 
 INIT_POOL(Proxy);
 
-Proxy::Proxy(struct ev_loop* event_loop_, int conn_fd) :
+Proxy::Proxy(struct ev_loop* event_loop_, int conn_fd, NameCacheOnPool *_name_cache) :
     frontend_buffer({ buffer_holder[0], buf_size }),
     backend_buffer({ buffer_holder[1], buf_size }),
     parser(frontend_buffer, backend_buffer, conn_fd),
+    name_cache{_name_cache},
     frontend(event_loop_, conn_fd, *this),
     backend(event_loop_, *this)
 {
@@ -25,7 +26,8 @@ Proxy::Frontend::Frontend(
     progress {proxy.progress},
     parser {proxy.parser},
     buffer {proxy.frontend_buffer},
-    backend {proxy.backend}
+    backend {proxy.backend},
+    name_cache {proxy.name_cache}
 {
     debug("Proxy::Frontend created");
 }
@@ -253,6 +255,9 @@ Proxy::Frontend::set_error(const buffer::string &err, int err_no)
 
 bool Proxy::Frontend::resolve_host(in_addr &host_ip)
 {
+    if (name_cache && name_cache->get(host_ip, host))
+        return false;
+
     struct addrinfo hints, *res;
 
     memset(&hints, 0, sizeof(hints));
@@ -267,6 +272,10 @@ bool Proxy::Frontend::resolve_host(in_addr &host_ip)
 
     host_ip = ((sockaddr_in *) (res->ai_addr))->sin_addr;
     freeaddrinfo(res);
+
+    if (name_cache)
+        name_cache->insert(host_ip, host);
+
     return false;
 }
 

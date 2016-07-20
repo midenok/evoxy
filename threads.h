@@ -22,7 +22,7 @@ public:
     virtual void release_thread(size_t managed_id) = 0;
 };
 
-const int MAX_TASK_SIZE = 96;
+const int MAX_TASK_SIZE = 128;
 
 class TaskHolder
 {

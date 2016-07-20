@@ -50,7 +50,9 @@ template<class OStream, class Object, typename ... Any>
 void debug_message(OStream& out, char q1, const char* file, int line, char q2, Object *obj, Any ... args)
 {
     std::ostringstream s;
-    s << q1 << basename(const_cast<char*>(file)) << ":" << line << q2 << " " << obj << ": ";
+    s << q1 << basename(const_cast<char*>(file)) << ":" << line << q2 << " ";
+    if (obj)
+        s << obj << ": ";
     stream_all(s, args...);
     s << std::endl;
     out << s.str() << std::flush;
@@ -71,7 +73,7 @@ if (ENABLED_OPT(TRACE)) \
     debug_message(std::cout, '<', __FILE__, __LINE__, '>', this, __FUNCTION__, "(): ", __VA_ARGS__)
 #define cdebug(...) \
 if (ENABLED_OPT(VERBOSE)) \
-    debug_message(std::cout, '{', __FILE__, __LINE__, '}', __FUNCTION__, "(): ", __VA_ARGS__)
+    debug_message(std::cout, '{', __FILE__, __LINE__, '}', (void *)0, __FUNCTION__, "(): ", __VA_ARGS__)
 #define error(...)  debug_message(std::cerr, '#', __FILE__, __LINE__, '#', this, __FUNCTION__, "(): ", __VA_ARGS__)
 #define cerror(...)  debug_message(std::cerr, '#', __FILE__, __LINE__, '#', __FUNCTION__, "(): ", __VA_ARGS__)
 #endif // NDEBUG

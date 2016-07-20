@@ -10,6 +10,7 @@
 #include "pool.h"
 #include "util.h"
 #include "connection.h"
+#include "cache.h"
 
 ThreadPool thread_pool;
 
@@ -34,7 +35,8 @@ class AcceptTask : public Task
     struct ev_loop *event_loop;
     ev_io accept_watcher;
     typedef Pool<Proxy> ConnectionPool;
-    std::unique_ptr<ConnectionPool> pool;
+    unique_ptr<ConnectionPool> pool;
+    unique_ptr<NameCacheOnPool> name_cache;
 
     void
     accept_conn()
@@ -53,7 +55,7 @@ class AcceptTask : public Task
         }
         debug("Got connection from ", inet_ntoa(peer_addr.sin_addr));
         try {
-            new (*pool) Proxy(event_loop, conn_fd);
+            new (*pool) Proxy(event_loop, conn_fd, name_cache.get());
         } catch (std::bad_alloc) {
             error("Memory pool is empty! Discarding connection from ", inet_ntoa(peer_addr.sin_addr));
             shutdown(conn_fd, SHUT_RDWR);
@@ -74,10 +76,15 @@ public:
         decltype(pool)::element_type::memsize(capacity);
     }
 
-    AcceptTask(size_t conn_capacity) : 
+    AcceptTask(size_t conn_capacity) :
         pool(new ConnectionPool(conn_capacity))
     {
         debug("AcceptTask created");
+
+        if (OPT_VALUE_NAME_CACHE) {
+            name_cache.reset(new NameCacheOnPool(OPT_VALUE_NAME_CACHE, OPT_VALUE_CACHE_LIFETIME));
+        }
+
         // listen socket setup
         listen_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd < 0) {
@@ -133,7 +140,8 @@ public:
         addr{src.addr},
         event_loop{src.event_loop},
         accept_watcher{src.accept_watcher},
-        pool(std::move(src.pool))
+        pool(std::move(src.pool)),
+        name_cache(std::move(src.name_cache))
     {
         debug("AcceptTask moved from ", &src);
         accept_watcher.data = this;
@@ -201,9 +209,12 @@ main(int argc, char ** argv)
 
     thread_pool.spawn_threads(accept_pool_sz + OPT_VALUE_WORKER_THREADS);
 
-    cdebug("main", "Running ", OPT_VALUE_ACCEPT_THREADS, " "
+    cdebug("Running ", OPT_VALUE_ACCEPT_THREADS, " "
            "accept threads; pool size: ", AcceptTask::pool_size(OPT_VALUE_ACCEPT_CAPACITY) / 1024, " kb; "
            "total pool size: ", AcceptTask::pool_size(OPT_VALUE_ACCEPT_CAPACITY) * OPT_VALUE_ACCEPT_THREADS / 1024, " kb.");
+
+    if (OPT_VALUE_NAME_CACHE)
+        cdebug("Using name cache of ", OPT_VALUE_NAME_CACHE, " capacity, lifetime ", OPT_VALUE_CACHE_LIFETIME, " secs");
 
     try
     {

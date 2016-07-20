@@ -4,6 +4,7 @@
 
 #include <list>
 #include <map>
+#include <netinet/in.h>
 #include "pool.h"
 #include "buffer_string.h"
 
@@ -18,24 +19,27 @@ struct DomainName
         /* To avoid string copying when finding,
            we may use external buffer 'str' (used when length == 0).
          */
-        buffer::string str;
+        buffer::istring str;
     } name;
 
-    buffer::string str() const
+    buffer::istring str() const
     {
-        return length ? buffer::string(name.data, length) : name.str;
+        return length ? buffer::istring(name.data, length) : name.str;
     }
 
     bool operator< (const DomainName &op) const
     {
+        // std::map can do 1 extra comparison:
+        // a < b, if false, then b < a (second one could be spared
+        // if map used 'cmp' semantics).
         return str() < op.str();
     }
 
-    DomainName(buffer::string _name, bool copy = true)
+    DomainName(buffer::istring _name, bool copy = true)
     {
         if (_name.size() > max_name)
             throw std::invalid_argument("Domain name is too long!");
-        
+
         if (copy) {
             length = (unsigned char) _name.size();
             _name.copy(name.data, max_name);
@@ -48,7 +52,7 @@ struct DomainName
     DomainName(const DomainName &src)
     {
         // copy-constructor always copies data!
-        buffer::string _name = src.str();
+        buffer::istring _name = src.str();
         length = _name.size();
         _name.copy(name.data, max_name);
     }
@@ -59,7 +63,10 @@ struct DomainValue
     typedef std::list<void *>::iterator proxy_iterator;
     proxy_iterator list_it;
     time_t ctime;
-    DomainValue()
+    in_addr host_ip;
+
+    DomainValue(in_addr &_host_ip) :
+        host_ip {_host_ip}
     {
         ctime = time(nullptr);
     }
@@ -91,7 +98,7 @@ public:
         assert(max_capacity);
     }
 
-    bool get(DomainName &name)
+    bool get(in_addr &host_ip, DomainName &name)
     {
         auto it = map::find(name);
         if (it == map::end())
@@ -106,24 +113,26 @@ public:
             return false;
         }
 
+        host_ip = it->second.host_ip;
+
         // most recently used goes to top:
         mru.splice(mru.begin(), mru, *l_it);
         return true;
     }
 
-    bool get(buffer::string &name)
+    bool get(in_addr &host_ip, buffer::istring &name)
     {
         DomainName d(name, NO_COPY);
-        return get(d);
+        return get(host_ip, d);
     }
 
-    bool get(const char *name)
+    bool get(in_addr &host_ip, const char *name)
     {
-        buffer::string s(name);
-        return get(s);
+        buffer::istring s(name);
+        return get(host_ip, s);
     }
 
-    void insert(DomainName &name)
+    void insert(in_addr &host_ip, DomainName &name)
     {
         list_iterator l_it;
         if (map::size() == max_capacity) {
@@ -132,7 +141,8 @@ public:
             map::erase(*l_it);
             mru.erase(l_it);
         }
-        std::pair<typename map::iterator, bool> res = map::insert(typename map::value_type(name, DomainValue()));
+        std::pair<typename map::iterator, bool> res =
+            map::insert(typename map::value_type(name, DomainValue(host_ip)));
         if (!res.second)
             return;
         mru.push_front(res.first);
@@ -140,20 +150,44 @@ public:
         res.first->second.list_it = *(DomainValue::proxy_iterator *)(void *)&l_it;
     }
 
-    void insert(buffer::string &name)
+    void insert(in_addr &host_ip, buffer::istring &name)
     {
         DomainName d(name, NO_COPY);
-        return insert(d);
+        return insert(host_ip, d);
     }
 
-    void insert(const char *name)
+    void insert(in_addr &host_ip, const char *name)
     {
-        buffer::string s(name);
-        return insert(s);
+        buffer::istring s(name);
+        return insert(host_ip, s);
     }
 };
 
 typedef std::_List_node<std::_Rb_tree_iterator<std::pair<DomainName const, DomainValue> > > ListNode;
 typedef std::_Rb_tree_node<std::pair<DomainName const, DomainValue> > MapNode;
+
+struct NameCacheInit
+{
+    Pool<MapNode> map_pool;
+    Pool<ListNode> list_pool;
+
+    NameCacheInit(size_t pool_size, time_t lifetime) :
+        map_pool(pool_size),
+        list_pool(pool_size)
+    {
+        PoolAllocator<MapNode>::init(map_pool);
+        PoolAllocator<ListNode>::init(list_pool);
+        NameCache<PoolAllocator<> >::init(pool_size, lifetime);
+    }
+};
+
+class NameCacheOnPool : NameCacheInit, public NameCache<PoolAllocator<> >
+{
+public:
+    NameCacheOnPool(size_t pool_size, time_t lifetime) :
+        NameCacheInit(pool_size, lifetime)
+    {
+    }
+};
 
 #endif // __evx_cache_h
