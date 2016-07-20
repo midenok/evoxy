@@ -10,6 +10,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <cassert>
 
 #include <netdb.h>
 #include <sys/unistd.h>

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.2)
 
 include_directories(${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
-add_executable(evoxy main.cc http.cc connection.cc evoxy.c threads.cc)
+add_executable(evoxy main.cc http.cc connection.cc evoxy.c threads.cc cache.cc)
 target_link_libraries(evoxy -lopts -lpthread -lev)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=gnu++11" )

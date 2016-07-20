@@ -27,6 +27,7 @@ Proxy::Frontend::Frontend(
     buffer {proxy.frontend_buffer},
     backend {proxy.backend}
 {
+    debug("Proxy::Frontend created");
 }
 
 /*
@@ -85,6 +86,7 @@ Proxy::Frontend::read_callback()
     default:
         break;
     }
+
 
     HTTPParser::Status s;
     switch (progress) {
@@ -279,6 +281,7 @@ Proxy::Backend::Backend(
     buffer { proxy.backend_buffer },
     frontend { proxy.frontend }
 {
+    debug("Proxy::Backend created");
     conn_watcher.fd = 0;
 }
 

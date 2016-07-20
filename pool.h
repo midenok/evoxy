@@ -1,96 +1,218 @@
 #ifndef __cd_pool_h
 #define __cd_pool_h
 
-#include <cassert>
-#include <cstddef>
 #include <vector>
-
-using std::vector;
+#include <cstddef>
+#include <cassert>
 
 template <class Object>
-class Pool
+union PoolNode
+{
+    char data[sizeof(Object)];
+    PoolNode *next;
+};
+
+struct PoolIface
+{
+    virtual void add_pool(size_t size) = 0;
+    virtual ~PoolIface() {}
+};
+
+template <class Object>
+class NoGrow : public PoolIface
 {
 public:
-    struct Chunk
+    void init(size_t capacity)
     {
-        char data[sizeof(Object)];
-    };
+        add_pool(capacity);
+    }
 
-private:
-    vector<Chunk> pool;
-    vector<size_t> freelist;
+    static
+    void on_get(PoolNode<Object> *free) throw (std::bad_alloc)
+    {
+        if (!free)
+            throw std::bad_alloc();
+    }
+};
+
+template <class Object, class GrowPolicy = NoGrow<Object> >
+class Pool : public GrowPolicy
+{
+    typedef PoolNode<Object> Node;
+    typedef std::pair<Node *, size_t> PoolItem;
+    std::vector<PoolItem> pools;
+    Node *free = nullptr;
+    Node *last_ = nullptr;
+
+    void add_pool(size_t size) override
+    {
+        free = new Node[size];
+
+        // form a linked list of blocks of this pool
+        pools.push_back(PoolItem(free, size));
+        for (int i = 0; i < size; ++i) {
+            free[i].next = &free[i + 1];
+        }
+        free[size - 1].next = nullptr;
+    }
 
 public:
+    Pool(const Pool&) = delete;
+
     Pool(size_t capacity)
     {
-        pool.resize(capacity);
-        freelist.reserve(capacity);
-        for (size_t id = 0; id < capacity; ++id)
-            freelist.push_back(id);
+        GrowPolicy::init(capacity);
     }
 
-    static size_t
-    memsize(size_t capacity = 1)
+    static
+    size_t
+    memsize(size_t capacity, bool gross = false)
     {
-        return (sizeof(Chunk) + sizeof(size_t)) * capacity;
+        return (gross ? sizeof(Pool) : 0) + sizeof(Node) * capacity;
     }
 
-    Chunk*
-    get(size_t &id) throw (std::bad_alloc)
+    size_t
+    memusage(bool gross = false)
     {
-        if (freelist.size() == 0)
-            throw std::bad_alloc();
+        size_t result = gross ? sizeof(Pool) + pools.capacity() : 0;
+        for (auto item: pools) {
+            result += sizeof(Node) * item.second;
+        }
+        return result;
+    }
 
-        id = freelist.back();
-        freelist.pop_back();
-        return &pool[id];
+    size_t
+    free_chunks() const
+    {
+        size_t chunks = 0;
+        for (Node *n = free; n; n = n->next)
+            chunks++;
+        return chunks;
+    }
+
+    void*
+    get() throw (std::bad_alloc)
+    {
+        GrowPolicy::on_get(free);
+        last_ = free;
+        free = free->next;
+        return static_cast<void*>(last_);
+    }
+
+    void*
+    last() const
+    {
+        return static_cast<void*>(last_);
     }
 
     void
-    release(size_t id)
+    release(void * block)
     {
-        assert(id < pool.size());
-        freelist.push_back(id);
+        Node* node = static_cast<Node*>(block);
+        node->next = free;
+        free = node;
+    }
+
+    ~Pool()
+    {
+        for (auto item : pools) {
+            delete item.first;
+        }
     }
 };
 
 #define INIT_POOL(Object) \
 template<> \
-thread_local size_t OnPool<Object>::id_ = 0; \
-template<> \
-thread_local Pool<Object>* OnPool<Object>::pool_ = nullptr;
+thread_local Pool<Object>* OnPool<Object>::pool = nullptr;
 
 template <class Object>
 class OnPool
 {
-    static thread_local size_t id_;
-    static thread_local Pool<Object> *pool_;
-
-    size_t id;
-    Pool<Object> &pool;
+    static thread_local Pool<Object> *pool;
 
 public:
-    OnPool() :
-        id{id_},
-        pool{*pool_} {}
-
-    virtual ~OnPool()
+    void * operator new(size_t bytes, Pool<Object> &_pool) throw(std::bad_alloc)
     {
-        pool.release(id);
+        assert(bytes == sizeof(Object));
+        if (!pool)
+            pool = &_pool;
+        else
+            assert(pool == &_pool);
+        return _pool.get();
     }
 
-    void * operator new(size_t count, Pool<Object> &pool) throw(std::bad_alloc)
-    {
-        pool_ = &pool;
-        return pool.get(id_);
-    }
     void operator delete (void * addr)
     {
+        pool->release(addr);
     }
 
     void release()
     {
         delete static_cast<Object *>(this);
+    }
+};
+
+template <class Object = int>
+class PoolAllocator
+{
+    static thread_local Pool<Object> *pool;
+
+public:
+    using value_type = Object;
+    using pointer = Object*;
+    using const_pointer = const Object*;
+    using reference = Object&;
+    using const_reference = const Object&;
+    using size_type = std::size_t;
+
+    static
+    void init(Pool<Object> &_pool)
+    {
+        pool = &_pool;
+    }
+
+    PoolAllocator()
+    {
+        assert(pool);
+    }
+
+    template <class U>
+    class rebind
+    {
+    public:
+        using other = PoolAllocator<U>;
+    };
+
+    static
+    pointer allocate(size_t n)
+    {
+        assert(n == 1);
+        return static_cast<Object*>(pool->get());
+    }
+
+    static
+    void deallocate(pointer p, size_t n)
+    {
+        assert(n == 1);
+        pool->release(static_cast<void*>(p));
+    }
+
+    static
+    void construct(pointer p, const_reference t)
+    {
+        new (p) Object(t);
+    }
+
+    static
+    void destroy(pointer p)
+    {
+        p->~Object();
+    }
+
+    static
+    size_type max_size()
+    {
+        return 1;
     }
 };
 

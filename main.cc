@@ -51,8 +51,14 @@ class AcceptTask : public Task
             error("Warning: unexpected EAGAIN!");
             return;
         }
-        debug("got connection!");
-        new (*pool) Proxy(event_loop, conn_fd);
+        debug("Got connection from ", inet_ntoa(peer_addr.sin_addr));
+        try {
+            new (*pool) Proxy(event_loop, conn_fd);
+        } catch (std::bad_alloc) {
+            error("Memory pool is empty! Discarding connection from ", inet_ntoa(peer_addr.sin_addr));
+            shutdown(conn_fd, SHUT_RDWR);
+            close(conn_fd);
+        }
     }
 
     static void
