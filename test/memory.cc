@@ -117,9 +117,9 @@ void check2(int pool_size, int timeout)
     int check = 0;
     Pool<MapNode> map_pool(pool_size);
     Pool<ListNode> list_pool(pool_size);
-    PoolAllocator<MapNode>::init(map_pool);
-    PoolAllocator<ListNode>::init(list_pool);
-    NameCache<PoolAllocator<> >::init(pool_size, timeout);
+    PoolAllocator<MapNode>::init_thread(map_pool);
+    PoolAllocator<ListNode>::init_thread(list_pool);
+    NameCache<PoolAllocator<> >::init_static(pool_size, timeout);
     NameCache<PoolAllocator<> > cache;
 
     if (++check, pool_size != map_pool.free_chunks()) {

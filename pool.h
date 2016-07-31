@@ -58,6 +58,7 @@ class Pool : public GrowPolicy
 
 public:
     Pool(const Pool&) = delete;
+    Pool(Pool&&) = delete;
 
     Pool(size_t capacity)
     {
@@ -166,7 +167,7 @@ public:
     using size_type = std::size_t;
 
     static
-    void init(Pool<Object> &_pool)
+    void init_thread(Pool<Object> &_pool)
     {
         pool = &_pool;
     }
@@ -187,6 +188,7 @@ public:
     pointer allocate(size_t n)
     {
         assert(n == 1);
+        assert(pool);
         return static_cast<Object*>(pool->get());
     }
 
@@ -194,6 +196,7 @@ public:
     void deallocate(pointer p, size_t n)
     {
         assert(n == 1);
+        assert(pool);
         pool->release(static_cast<void*>(p));
     }
 

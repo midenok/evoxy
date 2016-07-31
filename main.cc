@@ -150,6 +150,8 @@ public:
     }
     virtual void execute()
     {
+        if (name_cache)
+            name_cache->init_thread();
         ev_io_start(event_loop, &accept_watcher);
         socklen_t addr_len = sizeof(addr);
         int conn_fd = accept(listen_fd, (struct sockaddr *) &addr, &addr_len);

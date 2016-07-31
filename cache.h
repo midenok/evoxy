@@ -87,7 +87,7 @@ class NameCache : public std::map<DomainName, DomainValue, std::less<DomainName>
 
 public:
     static
-    void init(size_t _max_capacity, time_t _lifetime)
+    void init_static(size_t _max_capacity, time_t _lifetime)
     {
         max_capacity = _max_capacity;
         item_lifetime = _lifetime;
@@ -166,22 +166,30 @@ public:
 typedef std::_List_node<std::_Rb_tree_iterator<std::pair<DomainName const, DomainValue> > > ListNode;
 typedef std::_Rb_tree_node<std::pair<DomainName const, DomainValue> > MapNode;
 
-struct NameCacheInit
+class NameCacheInit
 {
     Pool<MapNode> map_pool;
     Pool<ListNode> list_pool;
+
+public:
+    void init_thread()
+    {
+        PoolAllocator<MapNode>::init_thread(map_pool);
+        PoolAllocator<ListNode>::init_thread(list_pool);
+    }
 
     NameCacheInit(size_t pool_size, time_t lifetime) :
         map_pool(pool_size),
         list_pool(pool_size)
     {
-        PoolAllocator<MapNode>::init(map_pool);
-        PoolAllocator<ListNode>::init(list_pool);
-        NameCache<PoolAllocator<> >::init(pool_size, lifetime);
+        init_thread();
+        NameCache<PoolAllocator<> >::init_static(pool_size, lifetime);
     }
 };
 
-class NameCacheOnPool : NameCacheInit, public NameCache<PoolAllocator<> >
+class NameCacheOnPool :
+    public NameCacheInit, // pools and NameCache static must be inited before NameCache object!
+    public NameCache<PoolAllocator<> >
 {
 public:
     NameCacheOnPool(size_t pool_size, time_t lifetime) :
