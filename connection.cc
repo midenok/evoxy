@@ -122,7 +122,7 @@ Proxy::Frontend::read_callback()
                     REQUEST_HEAD_FINISHED;
 
             debug("F: changed progress: ", progress);
-            if (parser.keep_alive) { // this flag is set only on response
+            if (backend.connected()) {
                 in_addr new_ip = host_ip;
                 if (parser.host != host) {
                     if (set_host(parser.host) || resolve_host(new_ip)) {
@@ -132,7 +132,7 @@ Proxy::Frontend::read_callback()
                     }
                 }
                 if (parser.port != port || new_ip.s_addr != host_ip.s_addr) {
-                    backend.shutdown();
+                    backend.terminate();
                     host_ip = new_ip;
                     port = parser.port;
                     if (backend.connect(host_ip, port)) {
@@ -143,6 +143,8 @@ Proxy::Frontend::read_callback()
                     debug("F: connected to ", host, ":", port);
                 } else {
                     backend.start_only_events(EV_WRITE);
+                    // FIXME: probably, FIN is coming from previous response
+                    // and we just stopped EV_READ...
                 }
             } else {
                 port = parser.port;
@@ -341,6 +343,7 @@ Proxy::Backend::error_callback(int err)
     return false;
 }
 
+
 bool
 Proxy::Backend::write_callback()
 {
@@ -363,6 +366,7 @@ Proxy::Backend::write_callback()
         std::swap(buffer, frontend.buffer);
         frontend.start_events(EV_READ);
     }
+
     IOBuffer::Status err = buffer.send(conn_watcher.fd);
 
     switch (err) {
@@ -392,10 +396,13 @@ Proxy::Backend::read_callback()
         return false;
     case IOBuffer::SHUTDOWN:
         stop_all_events();
+        close_fd();
         // TODO: check protocol, content-length, etc. to notify if its illegal to shutdown now
-        progress = RESPONSE_FINISHED;
-        debug("B: changed progress: ", progress);
-        frontend.start_events(EV_WRITE);
+        if (progress > REQUEST_STARTED) { // otherwise it is FIN from previous response
+            progress = RESPONSE_FINISHED;
+            debug("B: changed progress: ", progress);
+            frontend.start_events(EV_WRITE);
+        }
         return false;
     case IOBuffer::OTHER_ERROR:
         proxy.release();

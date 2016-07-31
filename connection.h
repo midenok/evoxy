@@ -29,6 +29,12 @@ protected:
     size_t spurious_reads = 0;
     size_t spurious_writes = 0;
 
+    void close_fd()
+    {
+        close(conn_watcher.fd);
+        conn_watcher.fd = 0;
+    }
+
 private:
     struct ev_loop *event_loop;
     ev_async async_watcher;
@@ -37,18 +43,6 @@ private:
     virtual bool read_callback() = 0;
     virtual bool write_callback() = 0;
     virtual bool error_callback(int err) = 0;
-
-    void terminate()
-    {
-        if (conn_watcher.fd) {
-            debug("terminating connection");
-            ev_io_stop(event_loop, &conn_watcher);
-            // No matter if it's not connected, ENOTCONN is not fatal
-            shutdown(conn_watcher.fd, SHUT_RDWR);
-            close(conn_watcher.fd);
-            conn_watcher.fd = 0;
-        }
-    }
 
     typedef void(*callback_f)(EV_P_ ev_io *w, int revents);
 
@@ -82,6 +76,17 @@ private:
     }
 
 public:
+
+    void terminate()
+    {
+        if (conn_watcher.fd) {
+            debug("terminating connection");
+            ev_io_stop(event_loop, &conn_watcher);
+            // No matter if it's not connected, ENOTCONN is not fatal
+            shutdown(conn_watcher.fd, SHUT_RDWR);
+            close_fd();
+        }
+    }
 
 #ifdef NDEBUG
     void start_events(int events)
@@ -454,20 +459,15 @@ class Proxy :
         Backend(struct ev_loop* event_loop_, Proxy &proxy_);
 
         bool connect(in_addr ip, uint32_t port);
+        bool connected() const
+        {
+            return conn_watcher.fd;
+        }
 
+    private:
         bool read_callback() override;
         bool write_callback() override;
         bool error_callback(int err) override;
-
-        void shutdown()
-        {
-            if (conn_watcher.fd) {
-                stop_all_events();
-                ::shutdown(conn_watcher.fd, SHUT_RDWR);
-                close(conn_watcher.fd);
-                conn_watcher.fd = 0;
-            }
-        }
     };
 
     Frontend frontend;
